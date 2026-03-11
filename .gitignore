@@ -1,0 +1,80 @@
+# ── Environment & Secrets ─────────────────────────────────────────────────────
+.env
+*.env
+*.env.*
+!.env.template           # Keep the template so others know what vars to set
+
+# Google Cloud service account key (never commit credentials!)
+*.json
+!package.json
+!package-lock.json
+
+# ── Generated Assets (can be large) ──────────────────────────────────────────
+assets/
+*.mp4
+*.mp3
+*.wav
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+
+# ── Local Database ─────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+.ENV/
+ENV/
+pip-selfcheck.json
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# mypy / type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ── OS Noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ── IDE / Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Temporary / debug files ───────────────────────────────────────────────────
+*.log
+dump.json
+test_*.mp4
+test_*.jpg
+test_*.mp3

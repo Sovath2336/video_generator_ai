@@ -1,0 +1,7 @@
+PyQt5==5.15.10
+moviepy==1.0.3
+google-genai
+google-cloud-texttospeech
+python-dotenv==1.0.1
+requests==2.31.0
+Pillow==10.2.0
