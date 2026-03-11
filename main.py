@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QPushButton, QHBoxLayout, QLineEdit, QMessageBox, QFrame,
     QScrollArea, QProgressBar, QSpinBox, QSplitter, QListWidget, QListWidgetItem,
-    QTextBrowser
+    QTextBrowser, QCheckBox
 )
 from PyQt5.QtGui import QPixmap
 import re
@@ -23,6 +23,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
 
 from ai_generator import (
     generate_script_from_topic,
+    analyze_text_to_scenes,
     generate_image_from_prompt,
     generate_audio_from_text
 )
@@ -31,6 +32,11 @@ import moviepy.editor as mp
 import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
+
+def make_safe_topic(topic: str) -> str:
+    """Returns a filesystem-safe folder/file name derived from the topic."""
+    safe = re.sub(r'[\\/:*?"<>|]', '_', topic or 'infographic').strip()
+    return safe[:80]
 
 class ImageGenerationThread(QThread):
     finished = pyqtSignal(bool, str)
@@ -59,18 +65,18 @@ class AudioGenerationThread(QThread):
 class BulkGenerationThread(QThread):
     """
     Processes ALL scenes sequentially: image then audio for each scene, in order.
-    This prevents API rate-limiting and ensures nothing is skipped.
+    Saves all assets into assets/{topic_folder}/scene_X.{ext}
     """
-    scene_progress = pyqtSignal(int, str, str)  # (scene_index, asset_type, status)
-    all_done = pyqtSignal(bool, str)            # (all_succeeded, summary_message)
+    scene_progress = pyqtSignal(int, str, str)
+    all_done = pyqtSignal(bool, str)
 
-    def __init__(self, scenes):
+    def __init__(self, scenes, topic_folder):
         super().__init__()
         self.scenes = scenes
+        self.topic_folder = topic_folder  # absolute path to topic sub-folder
 
     def run(self):
-        if not os.path.exists('assets'):
-            os.makedirs('assets')
+        os.makedirs(self.topic_folder, exist_ok=True)
 
         total = len(self.scenes)
         failed = []
@@ -80,7 +86,7 @@ class BulkGenerationThread(QThread):
 
             # --- Image ---
             self.scene_progress.emit(i, 'img', f'⏳ Generating image {idx}/{total}...')
-            img_path = f"assets/scene_{idx}.jpg"
+            img_path = os.path.join(self.topic_folder, f"scene_{idx}.jpg")
             img_ok = generate_image_from_prompt(scene.get('visual', ''), img_path)
             if img_ok:
                 scene['img_path'] = img_path
@@ -92,7 +98,7 @@ class BulkGenerationThread(QThread):
 
             # --- Audio ---
             self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {idx}/{total}...')
-            aud_path = f"assets/scene_{idx}.mp3"
+            aud_path = os.path.join(self.topic_folder, f"scene_{idx}.mp3")
             aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path)
             if aud_ok:
                 scene['audio_path'] = aud_path
@@ -187,13 +193,27 @@ class ScriptGenerationThread(QThread):
     chunk_received = pyqtSignal(str)
     finished = pyqtSignal()
     
-    def __init__(self, topic, duration):
+    def __init__(self, topic, duration, use_web_search=False):
         super().__init__()
         self.topic = topic
         self.duration = duration
+        self.use_web_search = use_web_search
         
     def run(self):
-        for chunk in generate_script_from_topic(self.topic, self.duration):
+        for chunk in generate_script_from_topic(self.topic, self.duration, self.use_web_search):
+            self.chunk_received.emit(chunk)
+        self.finished.emit()
+
+class AnalyzeTextThread(QThread):
+    chunk_received = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, source_text):
+        super().__init__()
+        self.source_text = source_text
+
+    def run(self):
+        for chunk in analyze_text_to_scenes(self.source_text):
             self.chunk_received.emit(chunk)
         self.finished.emit()
 
@@ -223,13 +243,55 @@ class ScriptTab(QWidget):
         self.generate_btn = QPushButton("✨ Generate Script")
         self.generate_btn.setProperty("class", "primary-button")
         self.generate_btn.clicked.connect(self.generate_script)
+
+        self.web_search_chk = QCheckBox("🌐 Search Web")
+        self.web_search_chk.setToolTip(
+            "When checked, Gemini will search Google for up-to-date\n"
+            "information about the topic before writing the script."
+        )
+        self.web_search_chk.setStyleSheet("QCheckBox { font-size: 13px; color: #cdd6f4; }")
         
         topic_layout.addWidget(QLabel("🚀 Topic:"))
         topic_layout.addWidget(self.topic_input)
         topic_layout.addWidget(QLabel("⏱️ Length:"))
         topic_layout.addWidget(self.duration_spin)
+        topic_layout.addWidget(self.web_search_chk)
         topic_layout.addWidget(self.generate_btn)
         layout.addLayout(topic_layout)
+
+        # --- Analyze Text Panel ---
+        analyze_frame = QFrame()
+        analyze_frame.setStyleSheet("background-color: #2b2b36; border-radius: 8px; padding: 8px;")
+        analyze_frame_layout = QVBoxLayout(analyze_frame)
+        analyze_frame_layout.setSpacing(6)
+
+        analyze_header = QHBoxLayout()
+        analyze_title = QLabel("📝 Analyze & Convert Text to Scenes")
+        analyze_title.setProperty("class", "h2")
+        analyze_header.addWidget(analyze_title)
+        analyze_header.addStretch()
+        analyze_frame_layout.addLayout(analyze_header)
+
+        self.analyze_input = QTextEdit()
+        self.analyze_input.setPlaceholderText(
+            "Paste any text here (article, blog post, notes, essay...)\n"
+            "AI will analyze it and extract scenes with visual prompts and narration."
+        )
+        self.analyze_input.setMaximumHeight(120)
+        analyze_frame_layout.addWidget(self.analyze_input)
+
+        analyze_btn_row = QHBoxLayout()
+        self.analyze_btn = QPushButton("🔍 Analyze & Generate Scenes")
+        self.analyze_btn.setProperty("class", "primary-button")
+        self.analyze_btn.clicked.connect(self.analyze_text)
+        self.analyze_status = QLabel("")
+        self.analyze_status.setStyleSheet("color: #a6e3a1;")
+        analyze_btn_row.addWidget(self.analyze_btn)
+        analyze_btn_row.addWidget(self.analyze_status)
+        analyze_btn_row.addStretch()
+        analyze_frame_layout.addLayout(analyze_btn_row)
+
+        layout.addWidget(analyze_frame)
         
         # Script Editor Section
         lbl = QLabel("Draft or Edit Your Script Here:")
@@ -306,15 +368,41 @@ class ScriptTab(QWidget):
         if not topic:
             QMessageBox.warning(self, "Input Error", "Please enter a topic first.")
             return
-            
+        
         self.generate_btn.setEnabled(False)
         self.generate_btn.setText("⏳ Generating...")
+        if self.web_search_chk.isChecked():
+            self.generate_btn.setText("🌐 Searching & Generating...")
         
         self.script_editor.clear()
-        self.thread = ScriptGenerationThread(topic, duration)
+        use_web = self.web_search_chk.isChecked()
+        self.thread = ScriptGenerationThread(topic, duration, use_web)
         self.thread.chunk_received.connect(self.on_chunk_received)
         self.thread.finished.connect(self.on_script_generated)
         self.thread.start()
+
+    def analyze_text(self):
+        source_text = self.analyze_input.toPlainText().strip()
+        if not source_text:
+            QMessageBox.warning(self, "Empty Input", "Please paste some text to analyze.")
+            return
+        
+        self.analyze_btn.setEnabled(False)
+        self.analyze_btn.setText("⏳ Analyzing...")
+        self.analyze_status.setText("⏳ Sending to Gemini...")
+        self.analyze_status.setStyleSheet("color: #f9e2af;")
+        self.script_editor.clear()
+        
+        self.analyze_thread = AnalyzeTextThread(source_text)
+        self.analyze_thread.chunk_received.connect(self.on_chunk_received)
+        self.analyze_thread.finished.connect(self.on_analyze_done)
+        self.analyze_thread.start()
+        
+    def on_analyze_done(self):
+        self.analyze_btn.setEnabled(True)
+        self.analyze_btn.setText("🔍 Analyze & Generate Scenes")
+        self.analyze_status.setText("✅ Done! Review script below then click Next.")
+        self.analyze_status.setStyleSheet("color: #a6e3a1;")
         
     def on_chunk_received(self, chunk):
         # Insert raw text continuously to the end
@@ -377,19 +465,24 @@ class StoryboardTab(QWidget):
         layout.addLayout(nav_layout)
         self.setLayout(layout)
 
-    def load_scenes(self, scenes):
+    def load_scenes(self, scenes, topic=''):
+        self._topic_folder = os.path.join(
+            os.path.dirname(__file__), 'assets', make_safe_topic(topic)
+        )
+        os.makedirs(self._topic_folder, exist_ok=True)
+                
         # Disconnect any old signal from previous renders
         try:
             self.generate_all_btn.clicked.disconnect()
         except TypeError:
             pass
-            
+
         # Clear existing layout except the stretch
         while self.scroll_layout.count() > 1:
             item = self.scroll_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-                
+
         scene_ui_refs = []  # list of (scene, status_lbl_img, status_lbl_aud, img_preview, view_img_btn, play_aud_btn)
         
         for i, scene in enumerate(scenes):
@@ -458,10 +551,9 @@ class StoryboardTab(QWidget):
             card_main_layout.addLayout(right_layout, stretch=1)
             
             # Capture the scope for the handlers
-            def create_img_handler(idx=i, prompt=scene['visual'], lbl=status_lbl_img, btn=gen_img_btn, p_lbl=img_preview, view_btn=view_img_btn):
-                if not os.path.exists('assets'):
-                    os.makedirs('assets')
-                out_path = f"assets/scene_{idx+1}.jpg"
+            def create_img_handler(idx=i, prompt=scene['visual'], lbl=status_lbl_img, btn=gen_img_btn, p_lbl=img_preview, view_btn=view_img_btn, tdir=self._topic_folder):
+                os.makedirs(tdir, exist_ok=True)
+                out_path = os.path.join(tdir, f"scene_{idx+1}.jpg")
                 btn.setEnabled(False)
                 lbl.setText("⏳ Generating Image...")
                 lbl.setStyleSheet("color: #f9e2af;") # Yellow
@@ -492,10 +584,9 @@ class StoryboardTab(QWidget):
                 thread.finished.connect(on_finish)
                 thread.start()
 
-            def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn):
-                if not os.path.exists('assets'):
-                    os.makedirs('assets')
-                out_path = f"assets/scene_{idx+1}.mp3"
+            def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn, tdir=self._topic_folder):
+                os.makedirs(tdir, exist_ok=True)
+                out_path = os.path.join(tdir, f"scene_{idx+1}.mp3")
                 btn.setEnabled(False)
                 lbl.setText("⏳ Generating Audio...")
                 lbl.setStyleSheet("color: #f9e2af;")
@@ -543,7 +634,7 @@ class StoryboardTab(QWidget):
             for j, (sc, lbl_img, lbl_aud, p_lbl, v_btn, pl_btn) in enumerate(scene_ui_refs):
                 status_map[j] = (lbl_img, lbl_aud, p_lbl, v_btn, pl_btn)
 
-            bulk_thread = BulkGenerationThread(scenes)
+            bulk_thread = BulkGenerationThread(scenes, self._topic_folder)
             setattr(self, '_bulk_thread', bulk_thread)
 
             def on_scene_progress(idx, asset_type, msg):
@@ -870,7 +961,7 @@ class AppWindow(QMainWindow):
 
     def on_script_next(self, scenes):
         self.current_scenes = scenes
-        self.storyboard_tab.load_scenes(self.current_scenes)
+        self.storyboard_tab.load_scenes(self.current_scenes, topic=self.current_topic)
         self.tabs.setCurrentIndex(1)
         self.export_tab.reset_ui()
         
@@ -894,13 +985,11 @@ class AppWindow(QMainWindow):
         self.export_tab.status_lbl.setStyleSheet("color: #f9e2af;") # yellow
         self.export_tab.status_lbl.setText(f"⏳ Stitching {len(self.current_scenes)} scenes...")
         
-        if not os.path.exists('assets'):
-            os.makedirs('assets')
-
-        # Sanitize the topic to be a valid filename
-        safe_topic = re.sub(r'[\\/:*?"<>|]', '_', self.current_topic or 'infographic').strip()
-        safe_topic = safe_topic[:80]  # Cap length
-        out_path = os.path.join(os.getcwd(), 'assets', f"{safe_topic}.mp4")
+        # Video goes into the same topic sub-folder
+        safe_topic = make_safe_topic(self.current_topic)
+        topic_folder = os.path.join(os.path.dirname(__file__), 'assets', safe_topic)
+        os.makedirs(topic_folder, exist_ok=True)
+        out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
         
         self.stitch_thread = VideoStitchingThread(self.current_scenes, out_path)
         self.stitch_thread.progress.connect(lambda msg: self.export_tab.status_lbl.setText(msg))
