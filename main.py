@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import ctypes
 from dotenv import load_dotenv
 
@@ -15,12 +16,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QPushButton, QHBoxLayout, QLineEdit, QMessageBox, QFrame,
     QScrollArea, QProgressBar, QSpinBox, QSplitter, QListWidget, QListWidgetItem,
-    QTextBrowser, QCheckBox
+    QTextBrowser, QCheckBox, QGridLayout, QSystemTrayIcon
 )
-from PyQt5.QtGui import QPixmap
-import re
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from ai_generator import (
     generate_script_from_topic,
     analyze_text_to_scenes,
@@ -114,8 +113,12 @@ class BulkGenerationThread(QThread):
             self.all_done.emit(True, f"All {total} scenes generated successfully!")
 
 class VideoStitchingThread(QThread):
-    progress = pyqtSignal(str)
+    progress_msg = pyqtSignal(str)
+    progress_pct = pyqtSignal(int)      # 0..100
     finished = pyqtSignal(bool, str)
+
+    PAUSE_DURATION = 0.4  # seconds of freeze between scenes
+    FPS = 24
 
     def __init__(self, scenes, output_path):
         super().__init__()
@@ -124,67 +127,77 @@ class VideoStitchingThread(QThread):
 
     def run(self):
         try:
-            self.progress.emit("Starting video stitching process...")
+            total = len(self.scenes)
             clips = []
-            
+
+            self.progress_msg.emit(f"Building {total} scene clips...")
+            self.progress_pct.emit(0)
+
             for i, scene in enumerate(self.scenes):
                 img_path = scene.get('img_path')
                 aud_path = scene.get('audio_path')
-                
-                # Wait: the user explicitly wanted merging without skipping.
-                # If they skipped generating, we must abort firmly until they finish!
+
                 if not img_path or not os.path.exists(img_path):
-                    self.finished.emit(False, f"Missing Image for Scene {i+1}. Please generate all assets before stitching.")
+                    self.finished.emit(False, f"Missing Image for Scene {i+1}.")
                     return
                 if not aud_path or not os.path.exists(aud_path):
-                    self.finished.emit(False, f"Missing Audio for Scene {i+1}. Please generate all assets before stitching.")
+                    self.finished.emit(False, f"Missing Audio for Scene {i+1}.")
                     return
-                    
-                self.progress.emit(f"Processing Scene {i+1} (Adding Motion & FX)...")
-                
-                # Load Audio
+
+                self.progress_msg.emit(f"Scene {i+1}/{total} — adding motion FX...")
+                pct = int((i / total) * 60)  # first 60% of progress bar = clip building
+                self.progress_pct.emit(pct)
+
                 audio_clip = mp.AudioFileClip(aud_path)
-                
-                # Load Image
-                img_clip = mp.ImageClip(img_path).set_duration(audio_clip.duration)
-                
-                # Dynamic Motion Effect: Cinematic Slow Zoom In (from 1.0 to 1.05x)
-                # This guarantees that the viewer feels movement instead of static shots
-                img_zoomed = img_clip.resize(lambda t: 1.0 + 0.05 * (t / audio_clip.duration))
-                
-                # Using CompositeVideoClip safely locks the image boundary to the original 16:9 crop 
-                # so that as it scales, the edges bleed cleanly out of frame.
-                scene_clip = mp.CompositeVideoClip([img_zoomed.set_pos('center')], size=img_clip.size).set_duration(audio_clip.duration)
-                
-                # Attach audio track
-                scene_clip = scene_clip.set_audio(audio_clip)
+                dur = audio_clip.duration
+
+                # Cinematic slow zoom-in (1.0x → 1.05x)
+                img_clip = mp.ImageClip(img_path).set_duration(dur)
+                img_zoomed = img_clip.resize(lambda t: 1.0 + 0.05 * (t / dur))
+                scene_clip = (
+                    mp.CompositeVideoClip([img_zoomed.set_pos('center')], size=img_clip.size)
+                    .set_duration(dur)
+                    .set_audio(audio_clip)
+                )
+
+                # Add pause — freeze last frame of scene (silent) for natural breathing room
+                freeze = mp.ImageClip(img_path).set_duration(self.PAUSE_DURATION)
+
                 clips.append(scene_clip)
-                
-            if not clips:
-                self.finished.emit(False, "No valid scenes found to stitch.")
-                return
-                
-            self.progress.emit("Applying dynamic crossfade transitions between scenes...")
-            crossfade_duration = 0.5
-            final_clips = [clips[0]]
-            
-            for c in clips[1:]:
-                # Enable overlapping visually by requesting explicit "crossfade in" 
-                final_clips.append(c.crossfadein(crossfade_duration))
-                
-            self.progress.emit("Concatenating into single timeline...")
-            # We strictly set padding to negative match the transition overlap and use the 'compose' renderer
-            final_video = mp.concatenate_videoclips(final_clips, padding=-crossfade_duration, method="compose")
-            
-            self.progress.emit(f"Writing final video to {self.output_path} (This may take a while)...")
+                clips.append(freeze)  # pause after EVERY scene including the last
+
+            self.progress_msg.emit("Applying crossfade transitions...")
+            self.progress_pct.emit(62)
+
+            crossfade = 0.5
+            # Interleave: scene -> pause -> scene -> pause ...
+            # Apply crossfade to non-pause clips only (pause clips are silent/simple)
+            final_clips = [clips[0]]  # first scene clip (no crossfade on very first)
+            for j, c in enumerate(clips[1:], start=1):
+                # Only crossfade on actual scene clips, not freeze frames
+                if j % 2 == 0:  # even indices = scene clips
+                    final_clips.append(c.crossfadein(crossfade))
+                else:           # odd indices = freeze pauses
+                    final_clips.append(c)
+
+            self.progress_msg.emit("Concatenating timeline...")
+            self.progress_pct.emit(70)
+            final_video = mp.concatenate_videoclips(final_clips, padding=-crossfade, method="compose")
+
+            self.progress_msg.emit(f"Encoding video (ultrafast)...")
+            self.progress_pct.emit(75)
+
             final_video.write_videofile(
-                self.output_path, 
-                fps=24, 
-                codec="libx264", 
+                self.output_path,
+                fps=self.FPS,
+                codec="libx264",
                 audio_codec="aac",
-                logger=None # Suppress internal printing
+                preset="ultrafast",   # much faster encode; small file size trade-off
+                threads=4,
+                logger=None
             )
-            
+
+            self.progress_pct.emit(100)
             self.finished.emit(True, self.output_path)
         except Exception as e:
             self.finished.emit(False, str(e))
@@ -680,50 +693,193 @@ class ExportTab(QWidget):
 
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        root = QVBoxLayout()
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
 
-        label = QLabel("Video Export Settings")
-        label.setAlignment(Qt.AlignCenter)
-        label.setProperty("class", "h2")
-        layout.addWidget(label)
-
-        frame = QFrame()
-        frame.setStyleSheet("background-color: #2b2b36; border-radius: 8px;")
-        self.frame_layout = QVBoxLayout()
-        
-        self.status_lbl = QLabel("Ready to export once all assets are generated.", alignment=Qt.AlignCenter)
-        self.status_lbl.setWordWrap(True)
-        self.frame_layout.addWidget(self.status_lbl)
-        
-        frame.setLayout(self.frame_layout)
-        layout.addWidget(frame)
-        
-        # Bottom nav
-        nav_layout = QHBoxLayout()
+        header_row = QHBoxLayout()
+        title = QLabel("🎬 Export Video")
+        title.setProperty("class", "h2")
         self.back_btn = QPushButton("⬅ Back to Storyboard")
         self.back_btn.clicked.connect(self.back_requested.emit)
-        
+        header_row.addWidget(title)
+        header_row.addStretch()
+        header_row.addWidget(self.back_btn)
+        root.addLayout(header_row)
+
+        # ── Thumbnail Grid ────────────────────────────────────────────────
+        thumb_label = QLabel("🖼️ Scene Thumbnails")
+        thumb_label.setStyleSheet("font-weight:bold; color:#cdd6f4;")
+        root.addWidget(thumb_label)
+
+        self.thumb_scroll = QScrollArea()
+        self.thumb_scroll.setWidgetResizable(True)
+        self.thumb_scroll.setMaximumHeight(160)
+        self.thumb_scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self.thumb_widget = QWidget()
+        self.thumb_layout = QHBoxLayout(self.thumb_widget)
+        self.thumb_layout.setSpacing(8)
+        self.thumb_layout.setContentsMargins(0, 0, 0, 0)
+        self.thumb_layout.addStretch()
+        self.thumb_scroll.setWidget(self.thumb_widget)
+        root.addWidget(self.thumb_scroll)
+
+        # ── Status & Progress ────────────────────────────────────────────
+        status_frame = QFrame()
+        status_frame.setStyleSheet("background:#2b2b36; border-radius:8px; padding:12px;")
+        sf_layout = QVBoxLayout(status_frame)
+
+        self.status_lbl = QLabel("Ready to export once all assets are generated.",
+                                 alignment=Qt.AlignCenter)
+        self.status_lbl.setWordWrap(True)
+        sf_layout.addWidget(self.status_lbl)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(10)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { background:#181825; border-radius:5px; }
+            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #2563eb, stop:1 #a855f7); border-radius:5px; }
+        """)
+        self.progress_bar.hide()
+        sf_layout.addWidget(self.progress_bar)
+
+        self.pct_lbl = QLabel("", alignment=Qt.AlignCenter)
+        self.pct_lbl.setStyleSheet("color:#89b4fa; font-weight:bold; font-size:13px;")
+        self.pct_lbl.hide()
+        sf_layout.addWidget(self.pct_lbl)
+
+        root.addWidget(status_frame)
+        root.addStretch()
+
+        # ── Render button ────────────────────────────────────────────────
         self.render_btn = QPushButton("🎬 Stitch Final Video")
         self.render_btn.setProperty("class", "success-button")
+        self.render_btn.setMinimumHeight(44)
         self.render_btn.clicked.connect(self.start_stitch.emit)
-        
-        nav_layout.addWidget(self.back_btn)
-        nav_layout.addStretch()
-        nav_layout.addWidget(self.render_btn)
+        root.addWidget(self.render_btn)
 
-        layout.addLayout(nav_layout)
-        self.setLayout(layout)
-        
+        # ── Post-render action buttons (hidden until video is ready) ─────
+        action_row = QHBoxLayout()
+        self.view_video_btn = QPushButton("🎬 View Video")
+        self.view_video_btn.setProperty("class", "success-button")
+        self.view_video_btn.setMinimumHeight(40)
+        self.view_video_btn.hide()
+        self.open_folder_btn = QPushButton("📂 Open Folder")
+        self.open_folder_btn.setProperty("class", "secondary-button")
+        self.open_folder_btn.setMinimumHeight(40)
+        self.open_folder_btn.hide()
+        action_row.addWidget(self.view_video_btn)
+        action_row.addWidget(self.open_folder_btn)
+        root.addLayout(action_row)
+
+        self.setLayout(root)
+
+        # Spinner timer for animated dots while rendering
+        self._spin_dots = 0
+        self._spin_timer = QTimer()
+        self._spin_timer.timeout.connect(self._spin_tick)
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+    def populate_thumbnails(self, scenes):
+        """Populate the horizontal thumbnail grid from scene img_paths."""
+        # Clear old thumbs
+        while self.thumb_layout.count() > 1:
+            item = self.thumb_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for i, scene in enumerate(scenes):
+            img_path = scene.get('img_path', '')
+            cell = QFrame()
+            cell.setFixedSize(130, 90)
+            cell.setStyleSheet("background:#181825; border-radius:4px;")
+            cell_layout = QVBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setSpacing(2)
+
+            thumb = QLabel()
+            thumb.setFixedSize(130, 73)
+            thumb.setAlignment(Qt.AlignCenter)
+            if img_path and os.path.exists(img_path):
+                pix = QPixmap(img_path).scaled(130, 73, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                thumb.setPixmap(pix)
+            else:
+                thumb.setText("No Image")
+                thumb.setStyleSheet("color:#585b70; font-size:10px;")
+
+            num_lbl = QLabel(f"Scene {i+1}", alignment=Qt.AlignCenter)
+            num_lbl.setStyleSheet("color:#a6adc8; font-size:10px;")
+
+            cell_layout.addWidget(thumb)
+            cell_layout.addWidget(num_lbl)
+            self.thumb_layout.insertWidget(self.thumb_layout.count() - 1, cell)
+
+    def set_progress(self, pct: int, msg: str):
+        self.status_lbl.setText(msg)
+        self.progress_bar.setValue(pct)
+        self.pct_lbl.setText(f"{pct}%")
+
+    def start_render_ui(self):
+        self.render_btn.setEnabled(False)
+        self.render_btn.setText("⏳ Stitching...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.pct_lbl.setText("0%")
+        self.pct_lbl.show()
+        self.status_lbl.setStyleSheet("color:#f9e2af;")
+        self._spin_timer.start(500)
+
+    def stop_render_ui(self, success: bool, msg: str):
+        self._spin_timer.stop()
+        self.render_btn.setEnabled(True)
+        self.render_btn.setText("🎬 Stitch Final Video")
+        self.progress_bar.hide()
+        self.pct_lbl.hide()
+        if success:
+            self.status_lbl.setStyleSheet("color:#a6e3a1;")
+            self.status_lbl.setText(f"✅ Video saved:\n{msg}")
+            # Wire and show action buttons
+            try:
+                self.view_video_btn.clicked.disconnect()
+                self.open_folder_btn.clicked.disconnect()
+            except TypeError:
+                pass
+            self.view_video_btn.clicked.connect(lambda: os.startfile(os.path.abspath(msg)))
+            self.open_folder_btn.clicked.connect(
+                lambda: os.startfile(os.path.abspath(os.path.dirname(msg)))
+            )
+            self.view_video_btn.show()
+            self.open_folder_btn.show()
+        else:
+            self.status_lbl.setStyleSheet("color:#f38ba8;")
+            self.status_lbl.setText(f"❌ Failed:\n{msg}")
+            self.view_video_btn.hide()
+            self.open_folder_btn.hide()
+
+    def _spin_tick(self):
+        self._spin_dots = (self._spin_dots + 1) % 4
+        dots = '.' * self._spin_dots
+        cur = self.status_lbl.text()
+        # Strip old dots suffix cleanly
+        base = cur.rstrip('.')
+        self.status_lbl.setText(base.rstrip() + dots)
+
     def reset_ui(self):
         self.status_lbl.setText("Ready to stitch.")
         self.status_lbl.setStyleSheet("color: #cdd6f4;")
         self.render_btn.setEnabled(True)
+        self.progress_bar.hide()
+        self.pct_lbl.hide()
+        self.view_video_btn.hide()
+        self.open_folder_btn.hide()
 
 class HistoryTab(QWidget):
     """Shows all previously generated scripts and lets the user inspect assets and play the final video."""
-
+    restitch_requested = pyqtSignal(list, str)  # (scenes_as_dicts, topic)
     def __init__(self):
         super().__init__()
         root_layout = QVBoxLayout()
@@ -790,10 +946,40 @@ class HistoryTab(QWidget):
         self.play_video_btn.setProperty("class", "success-button")
         self.play_video_btn.hide()
         self.play_video_btn.clicked.connect(self._play_video)
+        self.restitch_btn = QPushButton("🔁 Re-Stitch Video")
+        self.restitch_btn.setProperty("class", "primary-button")
+        self.restitch_btn.hide()
+        self.restitch_btn.clicked.connect(self._on_restitch_clicked)
+        self.view_video_btn = QPushButton("🎬 View Video")
+        self.view_video_btn.setProperty("class", "success-button")
+        self.view_video_btn.hide()
+        self.open_folder_btn = QPushButton("📂 Open Folder")
+        self.open_folder_btn.setProperty("class", "secondary-button")
+        self.open_folder_btn.hide()
         vid_row.addWidget(self.video_lbl)
         vid_row.addStretch()
+        vid_row.addWidget(self.restitch_btn)
+        vid_row.addWidget(self.view_video_btn)
+        vid_row.addWidget(self.open_folder_btn)
         vid_row.addWidget(self.play_video_btn)
         right_layout.addLayout(vid_row)
+
+        self.restitch_status = QLabel("")
+        self.restitch_status.setAlignment(Qt.AlignCenter)
+        self.restitch_status.setWordWrap(True)
+        self.restitch_status.hide()
+        self.restitch_progress = QProgressBar()
+        self.restitch_progress.setRange(0, 100)
+        self.restitch_progress.setFixedHeight(8)
+        self.restitch_progress.setTextVisible(False)
+        self.restitch_progress.setStyleSheet("""
+            QProgressBar { background:#181825; border-radius:4px; }
+            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                stop:0 #2563eb, stop:1 #a855f7); border-radius:4px; }
+        """)
+        self.restitch_progress.hide()
+        right_layout.addWidget(self.restitch_status)
+        right_layout.addWidget(self.restitch_progress)
 
         # Scene scroll area
         right_layout.addWidget(QLabel("🎬 Scenes & Assets:"))
@@ -813,8 +999,10 @@ class HistoryTab(QWidget):
         root_layout.addWidget(splitter)
         self.setLayout(root_layout)
 
-        self._topic_rows = []   # cache of db rows
+        self._topic_rows = []
         self._current_video_path = None
+        self._current_scenes = []   # scene dicts built from DB for re-stitching
+        self._current_topic = ""
         self.load_history()
 
     # ------------------------------------------------------------------ #
@@ -836,22 +1024,64 @@ class HistoryTab(QWidget):
             return
 
         _, topic, duration, script_text, created_at = topic_row
+        self._current_topic = topic
         self.detail_header.setText(f"🎬 {topic}  ({duration} min)  ·  {created_at[:16]}")
         self.script_view.setPlainText(script_text or "")
 
-        # Check for a final video in the assets folder
-        safe_topic = re.sub(r'[\\/:*?"<>|]', '_', topic).strip()[:80]
-        video_path = os.path.join(os.path.dirname(__file__), 'assets', f"{safe_topic}.mp4")
+        # Build scene dicts usable by VideoStitchingThread
+        self._current_scenes = [
+            {
+                'visual': visual,
+                'narration': narration,
+                'img_path': img_path or '',
+                'audio_path': audio_path or '',
+                'db_id': sid,
+            }
+            for (sid, order, visual, narration, img_path, audio_path) in scenes
+        ]
+
+        # Check for a final video in the topic sub-folder
+        safe_topic = make_safe_topic(topic)
+        video_path = os.path.join(os.path.dirname(__file__), 'assets', safe_topic, f"{safe_topic}.mp4")
         if os.path.exists(video_path):
             self._current_video_path = video_path
             self.video_lbl.setText(f"✅ {os.path.basename(video_path)}")
             self.video_lbl.setStyleSheet("color: #a6e3a1;")
             self.play_video_btn.show()
+            # Wire view/folder
+            try:
+                self.view_video_btn.clicked.disconnect()
+                self.open_folder_btn.clicked.disconnect()
+            except TypeError:
+                pass
+            self.view_video_btn.clicked.connect(
+                lambda: os.startfile(os.path.abspath(video_path))
+            )
+            self.open_folder_btn.clicked.connect(
+                lambda: os.startfile(os.path.abspath(os.path.dirname(video_path)))
+            )
+            self.view_video_btn.show()
+            self.open_folder_btn.show()
         else:
             self._current_video_path = None
-            self.video_lbl.setText("No final video found for this topic.")
+            self.video_lbl.setText("No final video yet.")
             self.video_lbl.setStyleSheet("color: #585b70;")
             self.play_video_btn.hide()
+            self.view_video_btn.hide()
+            self.open_folder_btn.hide()
+
+        # Show Re-Stitch button only if all assets exist on disk
+        all_ready = all(
+            s['img_path'] and os.path.exists(s['img_path']) and
+            s['audio_path'] and os.path.exists(s['audio_path'])
+            for s in self._current_scenes
+        ) and bool(self._current_scenes)
+        if all_ready:
+            self.restitch_btn.show()
+        else:
+            self.restitch_btn.hide()
+        self.restitch_status.hide()
+        self.restitch_progress.hide()
 
         # Rebuild scenes
         while self.scenes_layout.count() > 1:
@@ -911,6 +1141,59 @@ class HistoryTab(QWidget):
         if self._current_video_path:
             os.startfile(os.path.abspath(self._current_video_path))
 
+    def _on_restitch_clicked(self):
+        if not self._current_scenes:
+            return
+        missing = [
+            f"Scene {i+1}: {'Image' if not (s['img_path'] and os.path.exists(s['img_path'])) else 'Audio'} missing"
+            for i, s in enumerate(self._current_scenes)
+            if not (s['img_path'] and os.path.exists(s['img_path']))
+            or not (s['audio_path'] and os.path.exists(s['audio_path']))
+        ]
+        if missing:
+            QMessageBox.warning(self, "Assets Missing",
+                "Cannot re-stitch — some assets are missing:\n\n" + "\n".join(missing))
+            return
+        self.restitch_requested.emit(self._current_scenes, self._current_topic)
+
+    def update_restitch_progress(self, pct: int, msg: str):
+        self.restitch_status.setText(msg)
+        self.restitch_status.setStyleSheet("color:#f9e2af;")
+        self.restitch_status.show()
+        self.restitch_progress.setValue(pct)
+        self.restitch_progress.show()
+        self.restitch_btn.setEnabled(False)
+        self.restitch_btn.setText("⏳ Stitching...")
+
+    def finish_restitch(self, success: bool, result_msg: str):
+        self.restitch_progress.hide()
+        self.restitch_btn.setEnabled(True)
+        self.restitch_btn.setText("🔁 Re-Stitch Video")
+        if success:
+            self.restitch_status.setText(f"✅ Done! Saved to: {os.path.basename(result_msg)}")
+            self.restitch_status.setStyleSheet("color:#a6e3a1;")
+            self._current_video_path = result_msg
+            self.video_lbl.setText(f"✅ {os.path.basename(result_msg)}")
+            self.video_lbl.setStyleSheet("color:#a6e3a1;")
+            self.play_video_btn.show()
+            # Wire view/folder buttons now that we have a confirmed path
+            try:
+                self.view_video_btn.clicked.disconnect()
+                self.open_folder_btn.clicked.disconnect()
+            except (TypeError, AttributeError):
+                pass
+            self.view_video_btn.clicked.connect(
+                lambda: os.startfile(os.path.abspath(result_msg))
+            )
+            self.open_folder_btn.clicked.connect(
+                lambda: os.startfile(os.path.abspath(os.path.dirname(result_msg)))
+            )
+            self.view_video_btn.show()
+            self.open_folder_btn.show()
+        else:
+            self.restitch_status.setText(f"❌ Failed: {result_msg[:120]}")
+            self.restitch_status.setStyleSheet("color:#f38ba8;")
+
 
 class AppWindow(QMainWindow):
     def __init__(self):
@@ -958,12 +1241,24 @@ class AppWindow(QMainWindow):
         self.export_tab.start_stitch.connect(self.start_stitching_process)
         # Refresh history list whenever a new script is saved
         self.script_tab.next_requested.connect(lambda _: self.history_tab.load_history())
+        # Re-stitching from history
+        self.history_tab.restitch_requested.connect(self.on_history_restitch)
+
+        # System tray for "done" notifications (works even when app is in background)
+        self._tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = QSystemTrayIcon(self)
+            # Use the window icon or a blank pixmap as tray icon
+            self._tray.setIcon(self.style().standardIcon(self.style().SP_ComputerIcon))
+            self._tray.setToolTip("Infographic Video Generator")
+            self._tray.show()
 
     def on_script_next(self, scenes):
         self.current_scenes = scenes
         self.storyboard_tab.load_scenes(self.current_scenes, topic=self.current_topic)
         self.tabs.setCurrentIndex(1)
         self.export_tab.reset_ui()
+        self.export_tab.populate_thumbnails(self.current_scenes)
         
     def start_stitching_process(self):
         # Strict upfront completeness check — collect every missing asset
@@ -981,29 +1276,79 @@ class AppWindow(QMainWindow):
             )
             return
             
-        self.export_tab.render_btn.setEnabled(False)
-        self.export_tab.status_lbl.setStyleSheet("color: #f9e2af;") # yellow
-        self.export_tab.status_lbl.setText(f"⏳ Stitching {len(self.current_scenes)} scenes...")
-        
+        self.export_tab.start_render_ui()
+        self.export_tab.set_progress(0, "Preparing clips…")
+
         # Video goes into the same topic sub-folder
         safe_topic = make_safe_topic(self.current_topic)
         topic_folder = os.path.join(os.path.dirname(__file__), 'assets', safe_topic)
         os.makedirs(topic_folder, exist_ok=True)
         out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
-        
+
         self.stitch_thread = VideoStitchingThread(self.current_scenes, out_path)
-        self.stitch_thread.progress.connect(lambda msg: self.export_tab.status_lbl.setText(msg))
+        self.stitch_thread.progress_msg.connect(
+            lambda msg: self.export_tab.status_lbl.setText(msg)
+        )
+        self.stitch_thread.progress_pct.connect(
+            lambda pct: self.export_tab.set_progress(pct, self.export_tab.status_lbl.text())
+        )
         self.stitch_thread.finished.connect(self.on_stitch_finished)
         self.stitch_thread.start()
         
     def on_stitch_finished(self, success, result_msg):
-        self.export_tab.render_btn.setEnabled(True)
-        if success:
-            self.export_tab.status_lbl.setStyleSheet("color: #a6e3a1;") # green
-            self.export_tab.status_lbl.setText(f"✅ Awesome! Video successfully saved to:\n{result_msg}")
-        else:
-            self.export_tab.status_lbl.setStyleSheet("color: #f38ba8;") # red
-            self.export_tab.status_lbl.setText(f"❌ Failed to stitch video:\n{result_msg}")
+        self.export_tab.stop_render_ui(success, result_msg)
+        
+        # Desktop notification — works even if the user has switched tabs
+        if hasattr(self, '_tray') and self._tray:
+            if success:
+                self._tray.showMessage(
+                    "Video Ready! 🎬",
+                    f"{os.path.basename(result_msg)} has been saved.",
+                    QSystemTrayIcon.Information, 5000
+                )
+                # Refresh thumbnails with any newly generated images
+                self.export_tab.populate_thumbnails(self.current_scenes)
+            else:
+                self._tray.showMessage(
+                    "Stitching Failed ❌",
+                    result_msg[:120],
+                    QSystemTrayIcon.Critical, 5000
+                )
+
+    def on_history_restitch(self, scenes, topic):
+        """Triggered by History tab Re-Stitch button — runs stitch in background, reports back inline."""
+        safe_topic = make_safe_topic(topic)
+        topic_folder = os.path.join(os.path.dirname(__file__), 'assets', safe_topic)
+        os.makedirs(topic_folder, exist_ok=True)
+        out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
+
+        self._history_stitch_thread = VideoStitchingThread(scenes, out_path)
+        self._history_stitch_thread.progress_msg.connect(
+            lambda msg: self.history_tab.update_restitch_progress(
+                self.history_tab.restitch_progress.value(), msg
+            )
+        )
+        self._history_stitch_thread.progress_pct.connect(
+            lambda pct: self.history_tab.update_restitch_progress(pct, self.history_tab.restitch_status.text())
+        )
+        self._history_stitch_thread.finished.connect(self.on_history_restitch_done)
+        self._history_stitch_thread.start()
+
+        if self._tray:
+            self._tray.showMessage("Re-Stitching Started ⏳",
+                f"Building video for “{topic}” in the background.",
+                QSystemTrayIcon.Information, 3000)
+
+    def on_history_restitch_done(self, success, result_msg):
+        self.history_tab.finish_restitch(success, result_msg)
+        if self._tray:
+            if success:
+                self._tray.showMessage("Re-Stitch Done! 🎬",
+                    f"{os.path.basename(result_msg)} saved.",
+                    QSystemTrayIcon.Information, 5000)
+            else:
+                self._tray.showMessage("Re-Stitch Failed ❌",
+                    result_msg[:120], QSystemTrayIcon.Critical, 5000)
 
 # --- MODERN DARK THEME QSS ---
 STYLESHEET = """
