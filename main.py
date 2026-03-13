@@ -16,10 +16,11 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QPushButton, QHBoxLayout, QLineEdit, QMessageBox, QFrame,
     QScrollArea, QProgressBar, QSpinBox, QSplitter, QListWidget, QListWidgetItem,
-    QTextBrowser, QCheckBox, QGridLayout, QSystemTrayIcon
+    QTextBrowser, QCheckBox, QGridLayout, QSystemTrayIcon, QComboBox, QDialog, QSlider
 )
 from PyQt5.QtGui import QPixmap, QIcon
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QUrl
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from ai_generator import (
     generate_script_from_topic,
     analyze_text_to_scenes,
@@ -52,13 +53,14 @@ class ImageGenerationThread(QThread):
 class AudioGenerationThread(QThread):
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, text, output_path):
+    def __init__(self, text, output_path, engine="gemini"):
         super().__init__()
         self.text = text
         self.output_path = output_path
+        self.engine = engine
         
     def run(self):
-        success = generate_audio_from_text(self.text, self.output_path)
+        success = generate_audio_from_text(self.text, self.output_path, self.engine)
         self.finished.emit(success, self.output_path)
 
 class BulkGenerationThread(QThread):
@@ -69,10 +71,15 @@ class BulkGenerationThread(QThread):
     scene_progress = pyqtSignal(int, str, str)
     all_done = pyqtSignal(bool, str)
 
-    def __init__(self, scenes, topic_folder):
+    def __init__(self, scenes, topic_folder, tts_engine="gemini"):
         super().__init__()
         self.scenes = scenes
         self.topic_folder = topic_folder  # absolute path to topic sub-folder
+        self.tts_engine = tts_engine
+        self.is_cancelled = False
+
+    def cancel(self):
+        self.is_cancelled = True
 
     def run(self):
         os.makedirs(self.topic_folder, exist_ok=True)
@@ -81,6 +88,10 @@ class BulkGenerationThread(QThread):
         failed = []
 
         for i, scene in enumerate(self.scenes):
+            if self.is_cancelled:
+                self.all_done.emit(False, "Generation was stopped by the user.")
+                return
+
             idx = i + 1
 
             # --- Image ---
@@ -97,8 +108,9 @@ class BulkGenerationThread(QThread):
 
             # --- Audio ---
             self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {idx}/{total}...')
-            aud_path = os.path.join(self.topic_folder, f"scene_{idx}.mp3")
-            aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path)
+            audio_ext = "wav" if self.tts_engine == "gemini" else "mp3"
+            aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{audio_ext}")
+            aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path, self.tts_engine)
             if aud_ok:
                 scene['audio_path'] = aud_path
                 db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
@@ -192,7 +204,7 @@ class VideoStitchingThread(QThread):
                 fps=self.FPS,
                 codec="libx264",
                 audio_codec="aac",
-                preset="ultrafast",   # much faster encode; small file size trade-off
+                preset="ultrafast",
                 threads=4,
                 logger=None
             )
@@ -440,13 +452,23 @@ class StoryboardTab(QWidget):
         header_layout = QHBoxLayout()
         label = QLabel("Storyboard (Generate Image & TTS Audio)")
         label.setProperty("class", "h2")
+        self.tts_engine_combo = QComboBox()
+        self.tts_engine_combo.addItems(["Gemini (Puck Voice)", "Google Cloud (Journey-D)"])
+        self.tts_engine_combo.setToolTip("Select the Text-to-Speech Engine for audio generation.")
         
         self.generate_all_btn = QPushButton("⚡ Auto-Generate All Scenes")
         self.generate_all_btn.setProperty("class", "success-button")
         
+        self.stop_btn = QPushButton("⏹️ Stop")
+        self.stop_btn.setProperty("class", "danger-button")
+        self.stop_btn.hide()
+        
         header_layout.addWidget(label)
         header_layout.addStretch()
+        header_layout.addWidget(QLabel("TTS Engine:"))
+        header_layout.addWidget(self.tts_engine_combo)
         header_layout.addWidget(self.generate_all_btn)
+        header_layout.addWidget(self.stop_btn)
         layout.addLayout(header_layout)
         
         # Scroll Area for assets list
@@ -599,12 +621,14 @@ class StoryboardTab(QWidget):
 
             def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn, tdir=self._topic_folder):
                 os.makedirs(tdir, exist_ok=True)
-                out_path = os.path.join(tdir, f"scene_{idx+1}.mp3")
+                audio_ext = "wav" if "Gemini" in self.tts_engine_combo.currentText() else "mp3"
+                out_path = os.path.join(tdir, f"scene_{idx+1}.{audio_ext}")
                 btn.setEnabled(False)
                 lbl.setText("⏳ Generating Audio...")
                 lbl.setStyleSheet("color: #f9e2af;")
                 
-                thread = AudioGenerationThread(text, out_path)
+                engine = "gemini" if "Gemini" in self.tts_engine_combo.currentText() else "google"
+                thread = AudioGenerationThread(text, out_path, engine)
                 setattr(self, f"aud_thread_{idx}", thread)
                 
                 def on_finish(success, path):
@@ -641,14 +665,31 @@ class StoryboardTab(QWidget):
             """Spawn a sequential BulkGenerationThread that processes each scene in order."""
             self.generate_all_btn.setEnabled(False)
             self.generate_all_btn.setText("⏳ Generating...")
+            self.stop_btn.show()
+            self.stop_btn.setEnabled(True)
+            self.stop_btn.setText("⏹️ Stop")
+            
+            engine = "gemini" if "Gemini" in self.tts_engine_combo.currentText() else "google"
 
             # Build a quick lookup from scene index to its UI labels
             status_map = {}  # index -> (img_lbl, aud_lbl, img_preview_lbl, view_img_btn, play_aud_btn)
             for j, (sc, lbl_img, lbl_aud, p_lbl, v_btn, pl_btn) in enumerate(scene_ui_refs):
                 status_map[j] = (lbl_img, lbl_aud, p_lbl, v_btn, pl_btn)
 
-            bulk_thread = BulkGenerationThread(scenes, self._topic_folder)
+            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine)
             setattr(self, '_bulk_thread', bulk_thread)
+
+            try:
+                self.stop_btn.clicked.disconnect()
+            except TypeError:
+                pass
+            
+            def stop_generation():
+                bulk_thread.cancel()
+                self.stop_btn.setEnabled(False)
+                self.stop_btn.setText("⏳ Stopping...")
+                
+            self.stop_btn.clicked.connect(stop_generation)
 
             def on_scene_progress(idx, asset_type, msg):
                 if idx not in status_map:
@@ -676,10 +717,11 @@ class StoryboardTab(QWidget):
             def on_all_done(all_ok, msg):
                 self.generate_all_btn.setEnabled(True)
                 self.generate_all_btn.setText("⚡ Auto-Generate All Scenes")
+                self.stop_btn.hide()
                 if all_ok:
                     self.generate_all_btn.setText("✅ All Scenes Generated")
                 else:
-                    QMessageBox.warning(self, "Generation Issues", msg)
+                    QMessageBox.warning(self, "Generation Issues/Stopped", msg)
 
             bulk_thread.scene_progress.connect(on_scene_progress)
             bulk_thread.all_done.connect(on_all_done)
@@ -923,20 +965,11 @@ class HistoryTab(QWidget):
         right_layout.setContentsMargins(6, 0, 0, 0)
         right_layout.setSpacing(10)
 
-        # Script area
+        # ---- Right panel widgets (defined first, added to layout at the end) ----
+
         self.detail_header = QLabel("Select a topic on the left to view details.")
         self.detail_header.setProperty("class", "h2")
         self.detail_header.setWordWrap(True)
-        right_layout.addWidget(self.detail_header)
-
-        self.script_view = QTextBrowser()
-        self.script_view.setMaximumHeight(180)
-        self.script_view.setStyleSheet(
-            "QTextBrowser { background: #11111b; border: 1px solid #313244; border-radius: 6px; color: #cdd6f4; padding: 8px; }"
-        )
-        self.script_view.setPlaceholderText("Script will appear here...")
-        right_layout.addWidget(QLabel("📄 Generated Script:"))
-        right_layout.addWidget(self.script_view)
 
         # Final video row
         vid_row = QHBoxLayout()
@@ -962,7 +995,6 @@ class HistoryTab(QWidget):
         vid_row.addWidget(self.view_video_btn)
         vid_row.addWidget(self.open_folder_btn)
         vid_row.addWidget(self.play_video_btn)
-        right_layout.addLayout(vid_row)
 
         self.restitch_status = QLabel("")
         self.restitch_status.setAlignment(Qt.AlignCenter)
@@ -978,11 +1010,33 @@ class HistoryTab(QWidget):
                 stop:0 #2563eb, stop:1 #a855f7); border-radius:4px; }
         """)
         self.restitch_progress.hide()
-        right_layout.addWidget(self.restitch_status)
-        right_layout.addWidget(self.restitch_progress)
 
-        # Scene scroll area
-        right_layout.addWidget(QLabel("🎬 Scenes & Assets:"))
+        # Script area
+        self.script_view = QTextBrowser()
+        self.script_view.setMaximumHeight(140)
+        self.script_view.setStyleSheet(
+            "QTextBrowser { background: #11111b; border: 1px solid #313244; border-radius: 6px; color: #cdd6f4; padding: 8px; }"
+        )
+        self.script_view.setPlaceholderText("Script will appear here...")
+
+        # Scene controls
+        scene_ctrl_row = QHBoxLayout()
+        self.history_tts_engine_combo = QComboBox()
+        self.history_tts_engine_combo.addItems(["Gemini (Puck Voice)", "Google Cloud (Journey-D)"])
+        self.history_tts_engine_combo.setToolTip("Select TTS engine for history scene audio generation.")
+        self.history_generate_all_btn = QPushButton("⚡ Auto-Generate All Scenes")
+        self.history_generate_all_btn.setProperty("class", "success-button")
+        self.history_generate_all_btn.clicked.connect(self._on_history_generate_all)
+        self.history_stop_btn = QPushButton("⏹️ Stop")
+        self.history_stop_btn.setProperty("class", "danger-button")
+        self.history_stop_btn.hide()
+        scene_ctrl_row.addWidget(QLabel("TTS Engine:"))
+        scene_ctrl_row.addWidget(self.history_tts_engine_combo)
+        scene_ctrl_row.addStretch()
+        scene_ctrl_row.addWidget(self.history_generate_all_btn)
+        scene_ctrl_row.addWidget(self.history_stop_btn)
+
+        # Scenes scroll
         self.scenes_scroll = QScrollArea()
         self.scenes_scroll.setWidgetResizable(True)
         self.scenes_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
@@ -991,7 +1045,74 @@ class HistoryTab(QWidget):
         self.scenes_layout.setSpacing(8)
         self.scenes_layout.addStretch()
         self.scenes_scroll.setWidget(self.scenes_widget)
+
+        # History audio player (in-app) — pinned to bottom
+        self.history_player_frame = QFrame()
+        self.history_player_frame.setStyleSheet(
+            "background:#1e1e2e; border:1px solid #313244; border-radius:8px;"
+        )
+        hp_layout = QVBoxLayout(self.history_player_frame)
+        hp_layout.setContentsMargins(10, 6, 10, 6)
+        hp_layout.setSpacing(2)
+
+        player_head = QHBoxLayout()
+        self.history_now_playing_lbl = QLabel("🎧 Now Playing: None")
+        self.history_now_playing_lbl.setStyleSheet("color:#cdd6f4; font-weight:600;")
+        self.history_audio_state_lbl = QLabel("Stopped")
+        self.history_audio_state_lbl.setStyleSheet("color:#a6adc8;")
+        self.history_now_playing_lbl.hide()
+        self.history_audio_state_lbl.hide()
+        player_head.addWidget(self.history_now_playing_lbl)
+        player_head.addStretch()
+        player_head.addWidget(self.history_audio_state_lbl)
+        hp_layout.addLayout(player_head)
+
+        self.history_audio_slider = QSlider(Qt.Horizontal)
+        self.history_audio_slider.setRange(0, 0)
+        self.history_audio_slider.setEnabled(False)
+        self.history_audio_slider.setStyleSheet(
+            "QSlider::groove:horizontal{height:6px;background:#181825;border-radius:3px;}"
+            "QSlider::handle:horizontal{background:#89b4fa;border:1px solid #b4befe;width:14px;margin:-5px 0;border-radius:7px;}"
+            "QSlider::sub-page:horizontal{background:#2563eb;border-radius:3px;}"
+        )
+        hp_layout.addWidget(self.history_audio_slider)
+
+        time_row = QHBoxLayout()
+        self.history_cur_time_lbl = QLabel("00:00")
+        self.history_cur_time_lbl.setStyleSheet("color:#a6adc8;")
+        self.history_total_time_lbl = QLabel("00:00")
+        self.history_total_time_lbl.setStyleSheet("color:#a6adc8;")
+        self.history_cur_time_lbl.hide()
+        self.history_total_time_lbl.hide()
+        time_row.addWidget(self.history_cur_time_lbl)
+        time_row.addStretch()
+        time_row.addWidget(self.history_total_time_lbl)
+        hp_layout.addLayout(time_row)
+
+        player_btn_row = QHBoxLayout()
+        self.history_player_play_btn = QPushButton("▶️ Play")
+        self.history_player_play_btn.setProperty("class", "secondary-button")
+        self.history_player_pause_btn = QPushButton("⏸️ Pause")
+        self.history_player_pause_btn.setProperty("class", "secondary-button")
+        self.history_player_stop_btn = QPushButton("⏹️ Stop")
+        self.history_player_stop_btn.setProperty("class", "secondary-button")
+        player_btn_row.addWidget(self.history_player_play_btn)
+        player_btn_row.addWidget(self.history_player_pause_btn)
+        player_btn_row.addWidget(self.history_player_stop_btn)
+        player_btn_row.addStretch()
+        hp_layout.addLayout(player_btn_row)
+
+        # Add to right_layout in final logical order
+        right_layout.addWidget(self.detail_header)
+        right_layout.addLayout(vid_row)
+        right_layout.addWidget(self.restitch_status)
+        right_layout.addWidget(self.restitch_progress)
+        right_layout.addWidget(QLabel("📄 Generated Script:"))
+        right_layout.addWidget(self.script_view)
+        right_layout.addWidget(QLabel("🎬 Scenes & Assets:"))
+        right_layout.addLayout(scene_ctrl_row)
         right_layout.addWidget(self.scenes_scroll)
+        right_layout.addWidget(self.history_player_frame)
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
@@ -1003,6 +1124,24 @@ class HistoryTab(QWidget):
         self._current_video_path = None
         self._current_scenes = []   # scene dicts built from DB for re-stitching
         self._current_topic = ""
+        self._history_topic_folder = ""
+        self._history_scene_refs = []
+        self._history_scene_audio_controls = {}
+        self._history_scene_audio_paths = {}
+        self._audio_player = QMediaPlayer(self)
+        self._audio_player_scene_idx = None
+        self._audio_slider_dragging = False
+        self._audio_player.positionChanged.connect(self._on_history_audio_position_changed)
+        self._audio_player.durationChanged.connect(self._on_history_audio_duration_changed)
+        self._audio_player.stateChanged.connect(self._on_history_audio_state_changed)
+        self.history_audio_slider.sliderPressed.connect(self._on_history_audio_slider_pressed)
+        self.history_audio_slider.sliderReleased.connect(self._on_history_audio_slider_released)
+        self.history_audio_slider.sliderMoved.connect(self._on_history_audio_slider_moved)
+        self.history_player_play_btn.clicked.connect(self._on_history_player_play_clicked)
+        self.history_player_pause_btn.clicked.connect(self._on_history_player_pause_clicked)
+        self.history_player_stop_btn.clicked.connect(self._on_history_player_stop_clicked)
+        self._reset_history_player_ui()
+        self.history_generate_all_btn.setEnabled(False)
         self.load_history()
 
     # ------------------------------------------------------------------ #
@@ -1047,8 +1186,6 @@ class HistoryTab(QWidget):
             self._current_video_path = video_path
             self.video_lbl.setText(f"✅ {os.path.basename(video_path)}")
             self.video_lbl.setStyleSheet("color: #a6e3a1;")
-            self.play_video_btn.show()
-            # Wire view/folder
             try:
                 self.view_video_btn.clicked.disconnect()
                 self.open_folder_btn.clicked.disconnect()
@@ -1062,6 +1199,7 @@ class HistoryTab(QWidget):
             )
             self.view_video_btn.show()
             self.open_folder_btn.show()
+            self.play_video_btn.hide()
         else:
             self._current_video_path = None
             self.video_lbl.setText("No final video yet.")
@@ -1070,76 +1208,465 @@ class HistoryTab(QWidget):
             self.view_video_btn.hide()
             self.open_folder_btn.hide()
 
-        # Show Re-Stitch button only if all assets exist on disk
+        self._history_topic_folder = os.path.join(
+            os.path.dirname(__file__), 'assets', make_safe_topic(topic)
+        )
+        os.makedirs(self._history_topic_folder, exist_ok=True)
+        self._audio_player.stop()
+        self._audio_player_scene_idx = None
+        self._reset_history_player_ui()
+        self.history_generate_all_btn.setEnabled(bool(self._current_scenes))
+        self._update_restitch_button_visibility()
+        self.restitch_status.hide()
+        self.restitch_progress.hide()
+        self._render_history_scene_cards()
+
+    def _update_restitch_button_visibility(self):
         all_ready = all(
             s['img_path'] and os.path.exists(s['img_path']) and
             s['audio_path'] and os.path.exists(s['audio_path'])
             for s in self._current_scenes
         ) and bool(self._current_scenes)
-        if all_ready:
-            self.restitch_btn.show()
-        else:
-            self.restitch_btn.hide()
-        self.restitch_status.hide()
-        self.restitch_progress.hide()
+        self.restitch_btn.setVisible(all_ready)
 
-        # Rebuild scenes
+    def _render_history_scene_cards(self):
         while self.scenes_layout.count() > 1:
             item = self.scenes_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        for scene_row in scenes:
-            sid, order, visual, narration, img_path, audio_path = scene_row
+        self._history_scene_refs = []
+
+        for i, scene in enumerate(self._current_scenes):
             card = QFrame()
             card.setStyleSheet("background-color: #2b2b36; border-radius: 6px; padding: 8px;")
             card_layout = QHBoxLayout(card)
 
-            # Text block
             text_block = QVBoxLayout()
-            lbl_title = QLabel(f"<b>Scene {order}</b>")
-            lbl_visual = QLabel(f"<i>Visual:</i> {visual}")
+            lbl_title = QLabel(f"<b>Scene {i+1}</b>")
+            lbl_visual = QLabel(f"<i>Visual:</i> {scene['visual']}")
             lbl_visual.setWordWrap(True)
-            lbl_narr = QLabel(f"<i>Narration:</i> {narration}")
+            lbl_narr = QLabel(f"<i>Narration:</i> {scene['narration']}")
             lbl_narr.setWordWrap(True)
             text_block.addWidget(lbl_title)
             text_block.addWidget(lbl_visual)
             text_block.addWidget(lbl_narr)
 
-            # Asset buttons
-            btn_block = QVBoxLayout()
-            btn_block.setAlignment(Qt.AlignTop)
-            if img_path and os.path.exists(img_path):
-                view_img = QPushButton("🖥️ View Image")
-                view_img.setProperty("class", "secondary-button")
-                view_img.clicked.connect(lambda checked, p=img_path: os.startfile(os.path.abspath(p)))
-                btn_block.addWidget(view_img)
-            if audio_path and os.path.exists(audio_path):
-                play_aud = QPushButton("🔊 Play Audio")
-                play_aud.setProperty("class", "secondary-button")
-                play_aud.clicked.connect(lambda checked, p=audio_path: os.startfile(os.path.abspath(p)))
-                btn_block.addWidget(play_aud)
+            img_row = QHBoxLayout()
+            gen_img_btn = QPushButton("🖼️ Generate Image")
+            gen_img_btn.setProperty("class", "primary-button")
+            view_img_btn = QPushButton("👁️ View Image")
+            view_img_btn.setProperty("class", "secondary-button")
+            view_img_btn.hide()
+            img_status = QLabel("")
+            img_status.setStyleSheet("color: #a6e3a1;")
+            img_row.addWidget(gen_img_btn)
+            img_row.addWidget(view_img_btn)
+            img_row.addWidget(img_status)
+            img_row.addStretch()
+            text_block.addLayout(img_row)
 
-            # Thumbnail
+            aud_row = QHBoxLayout()
+            gen_aud_btn = QPushButton("🎙️ Generate Audio")
+            gen_aud_btn.setProperty("class", "primary-button")
+            play_aud_btn = QPushButton("🔊 Play Audio")
+            play_aud_btn.setProperty("class", "secondary-button")
+            pause_aud_btn = QPushButton("⏸️ Pause")
+            pause_aud_btn.setProperty("class", "secondary-button")
+            stop_aud_btn = QPushButton("⏹️ Stop")
+            stop_aud_btn.setProperty("class", "secondary-button")
+            play_aud_btn.hide()
+            pause_aud_btn.hide()
+            stop_aud_btn.hide()
+            aud_status = QLabel("")
+            aud_status.setStyleSheet("color: #a6e3a1;")
+            aud_row.addWidget(gen_aud_btn)
+            aud_row.addWidget(play_aud_btn)
+            aud_row.addWidget(pause_aud_btn)
+            aud_row.addWidget(stop_aud_btn)
+            aud_row.addWidget(aud_status)
+            aud_row.addStretch()
+            text_block.addLayout(aud_row)
+
             thumb = QLabel()
             thumb.setFixedSize(142, 80)
             thumb.setAlignment(Qt.AlignCenter)
-            if img_path and os.path.exists(img_path):
-                pix = QPixmap(img_path)
+            if scene.get('img_path') and os.path.exists(scene['img_path']):
+                pix = QPixmap(scene['img_path'])
                 thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                view_img_btn.show()
+                try:
+                    view_img_btn.clicked.disconnect()
+                except TypeError:
+                    pass
+                view_img_btn.clicked.connect(lambda _, p=scene['img_path']: self._show_history_image_preview(p))
             else:
                 thumb.setText("No Image")
                 thumb.setStyleSheet("background:#181825; color:#585b70; border-radius:4px;")
 
-            card_layout.addLayout(text_block, stretch=3)
-            card_layout.addLayout(btn_block)
-            card_layout.addWidget(thumb)
+            if scene.get('audio_path') and os.path.exists(scene['audio_path']):
+                self._history_scene_audio_paths[i] = scene['audio_path']
+                play_aud_btn.show()
+                pause_aud_btn.show()
+                stop_aud_btn.show()
+                try:
+                    play_aud_btn.clicked.disconnect()
+                except TypeError:
+                    pass
+                try:
+                    pause_aud_btn.clicked.disconnect()
+                except TypeError:
+                    pass
+                try:
+                    stop_aud_btn.clicked.disconnect()
+                except TypeError:
+                    pass
+                play_aud_btn.clicked.connect(
+                    lambda _, p=scene['audio_path'], idx=i, lbl=aud_status, pb=pause_aud_btn:
+                    self._play_history_audio(p, idx, lbl, pb)
+                )
+                pause_aud_btn.clicked.connect(
+                    lambda _, idx=i, lbl=aud_status, pb=pause_aud_btn:
+                    self._pause_resume_history_audio(idx, lbl, pb)
+                )
+                stop_aud_btn.clicked.connect(
+                    lambda _, idx=i, lbl=aud_status, pb=pause_aud_btn:
+                    self._stop_history_audio(idx, lbl, pb)
+                )
 
+            def create_img_handler(idx=i, s=scene, status_lbl=img_status, btn=gen_img_btn, preview_lbl=thumb, view_btn=view_img_btn):
+                out_path = os.path.join(self._history_topic_folder, f"scene_{idx+1}.jpg")
+                btn.setEnabled(False)
+                status_lbl.setText("⏳ Generating Image...")
+                status_lbl.setStyleSheet("color: #f9e2af;")
+                thread = ImageGenerationThread(s.get('visual', ''), out_path)
+                setattr(self, f"history_img_thread_{idx}", thread)
+
+                def on_finish(success, path):
+                    btn.setEnabled(True)
+                    if success:
+                        status_lbl.setText("✅ Image Generated!")
+                        status_lbl.setStyleSheet("color: #a6e3a1;")
+                        s['img_path'] = path
+                        db.update_scene_asset(s.get('db_id'), 'img_path', path)
+                        pix = QPixmap(path)
+                        preview_lbl.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                        view_btn.show()
+                        try:
+                            view_btn.clicked.disconnect()
+                        except TypeError:
+                            pass
+                        view_btn.clicked.connect(lambda _, p=path: self._show_history_image_preview(p))
+                    else:
+                        status_lbl.setText("❌ Image Failed.")
+                        status_lbl.setStyleSheet("color: #f38ba8;")
+                    self._update_restitch_button_visibility()
+
+                thread.finished.connect(on_finish)
+                thread.start()
+
+            def create_aud_handler(
+                idx=i, s=scene, status_lbl=aud_status, btn=gen_aud_btn,
+                play_btn=play_aud_btn, pause_btn=pause_aud_btn, stop_btn=stop_aud_btn
+            ):
+                engine = "gemini" if "Gemini" in self.history_tts_engine_combo.currentText() else "google"
+                audio_ext = "wav" if engine == "gemini" else "mp3"
+                out_path = os.path.join(self._history_topic_folder, f"scene_{idx+1}.{audio_ext}")
+                btn.setEnabled(False)
+                status_lbl.setText("⏳ Generating Audio...")
+                status_lbl.setStyleSheet("color: #f9e2af;")
+                thread = AudioGenerationThread(s.get('narration', ''), out_path, engine)
+                setattr(self, f"history_aud_thread_{idx}", thread)
+
+                def on_finish(success, path):
+                    btn.setEnabled(True)
+                    if success:
+                        status_lbl.setText("✅ Audio Saved.")
+                        status_lbl.setStyleSheet("color: #a6e3a1;")
+                        s['audio_path'] = path
+                        self._history_scene_audio_paths[idx] = path
+                        db.update_scene_asset(s.get('db_id'), 'audio_path', path)
+                        play_btn.show()
+                        pause_btn.show()
+                        stop_btn.show()
+                        try:
+                            play_btn.clicked.disconnect()
+                        except TypeError:
+                            pass
+                        try:
+                            pause_btn.clicked.disconnect()
+                        except TypeError:
+                            pass
+                        try:
+                            stop_btn.clicked.disconnect()
+                        except TypeError:
+                            pass
+                        play_btn.clicked.connect(
+                            lambda _, p=path, scene_idx=idx, lbl=status_lbl, pb=pause_btn:
+                            self._play_history_audio(p, scene_idx, lbl, pb)
+                        )
+                        pause_btn.clicked.connect(
+                            lambda _, scene_idx=idx, lbl=status_lbl, pb=pause_btn:
+                            self._pause_resume_history_audio(scene_idx, lbl, pb)
+                        )
+                        stop_btn.clicked.connect(
+                            lambda _, scene_idx=idx, lbl=status_lbl, pb=pause_btn:
+                            self._stop_history_audio(scene_idx, lbl, pb)
+                        )
+                    else:
+                        status_lbl.setText("❌ Audio Failed.")
+                        status_lbl.setStyleSheet("color: #f38ba8;")
+                    self._update_restitch_button_visibility()
+
+                thread.finished.connect(on_finish)
+                thread.start()
+
+            gen_img_btn.clicked.connect(create_img_handler)
+            gen_aud_btn.clicked.connect(create_aud_handler)
+
+            card_layout.addLayout(text_block, stretch=3)
+            card_layout.addWidget(thumb)
             self.scenes_layout.insertWidget(self.scenes_layout.count() - 1, card)
+            self._history_scene_refs.append((scene, img_status, aud_status, thumb, view_img_btn, play_aud_btn, pause_aud_btn, stop_aud_btn))
+            self._history_scene_audio_controls[i] = (aud_status, pause_aud_btn)
+
+    def _on_history_generate_all(self):
+        if not self._current_scenes:
+            return
+
+        self.history_generate_all_btn.setEnabled(False)
+        self.history_generate_all_btn.setText("⏳ Generating...")
+        self.history_stop_btn.show()
+        self.history_stop_btn.setEnabled(True)
+        self.history_stop_btn.setText("⏹️ Stop")
+
+        engine = "gemini" if "Gemini" in self.history_tts_engine_combo.currentText() else "google"
+        status_map = {idx: refs for idx, refs in enumerate(self._history_scene_refs)}
+
+        self._history_bulk_thread = BulkGenerationThread(self._current_scenes, self._history_topic_folder, engine)
+
+        try:
+            self.history_stop_btn.clicked.disconnect()
+        except TypeError:
+            pass
+
+        def stop_generation():
+            self._history_bulk_thread.cancel()
+            self.history_stop_btn.setEnabled(False)
+            self.history_stop_btn.setText("⏳ Stopping...")
+
+        self.history_stop_btn.clicked.connect(stop_generation)
+
+        def on_scene_progress(idx, asset_type, msg):
+            if idx not in status_map:
+                return
+            scene, lbl_img, lbl_aud, thumb, view_btn, play_btn, pause_btn, stop_btn = status_map[idx]
+            msg_l = (msg or "").lower()
+            is_done = "done" in msg_l
+            is_in_progress = "generating" in msg_l
+            if asset_type == 'img':
+                lbl_img.setText(msg)
+                lbl_img.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                if is_done and scene.get('img_path') and os.path.exists(scene['img_path']):
+                    pix = QPixmap(scene['img_path'])
+                    thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                    view_btn.show()
+                    try:
+                        view_btn.clicked.disconnect()
+                    except TypeError:
+                        pass
+                    view_btn.clicked.connect(lambda _, p=scene['img_path']: self._show_history_image_preview(p))
+            else:
+                lbl_aud.setText(msg)
+                lbl_aud.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                if is_done and scene.get('audio_path') and os.path.exists(scene['audio_path']):
+                    self._history_scene_audio_paths[idx] = scene['audio_path']
+                    play_btn.show()
+                    pause_btn.show()
+                    stop_btn.show()
+                    try:
+                        play_btn.clicked.disconnect()
+                    except TypeError:
+                        pass
+                    try:
+                        pause_btn.clicked.disconnect()
+                    except TypeError:
+                        pass
+                    try:
+                        stop_btn.clicked.disconnect()
+                    except TypeError:
+                        pass
+                    play_btn.clicked.connect(
+                        lambda _, p=scene['audio_path'], scene_idx=idx, lbl=lbl_aud, pb=pause_btn:
+                        self._play_history_audio(p, scene_idx, lbl, pb)
+                    )
+                    pause_btn.clicked.connect(
+                        lambda _, scene_idx=idx, lbl=lbl_aud, pb=pause_btn:
+                        self._pause_resume_history_audio(scene_idx, lbl, pb)
+                    )
+                    stop_btn.clicked.connect(
+                        lambda _, scene_idx=idx, lbl=lbl_aud, pb=pause_btn:
+                        self._stop_history_audio(scene_idx, lbl, pb)
+                    )
+
+        def on_all_done(all_ok, msg):
+            self.history_generate_all_btn.setEnabled(True)
+            self.history_generate_all_btn.setText("⚡ Auto-Generate All Scenes")
+            self.history_stop_btn.hide()
+            self._update_restitch_button_visibility()
+            if not all_ok:
+                QMessageBox.warning(self, "Generation Issues/Stopped", msg)
+
+        self._history_bulk_thread.scene_progress.connect(on_scene_progress)
+        self._history_bulk_thread.all_done.connect(on_all_done)
+        self._history_bulk_thread.start()
 
     def _play_video(self):
-        if self._current_video_path:
-            os.startfile(os.path.abspath(self._current_video_path))
+        return
+
+    def _format_ms(self, ms: int) -> str:
+        total_sec = max(0, int(ms // 1000))
+        mins = total_sec // 60
+        secs = total_sec % 60
+        return f"{mins:02d}:{secs:02d}"
+
+    def _reset_history_player_ui(self):
+        self.history_now_playing_lbl.setText("Now Playing: None")
+        self.history_audio_state_lbl.setText("Stopped")
+        self.history_cur_time_lbl.setText("00:00")
+        self.history_total_time_lbl.setText("00:00")
+        self.history_audio_slider.setRange(0, 0)
+        self.history_audio_slider.setValue(0)
+        self.history_audio_slider.setEnabled(False)
+        self.history_player_pause_btn.setText("Pause")
+
+    def _on_history_audio_position_changed(self, pos: int):
+        if self._audio_slider_dragging:
+            return
+        self.history_audio_slider.setValue(pos)
+        self.history_cur_time_lbl.setText(self._format_ms(pos))
+
+    def _on_history_audio_duration_changed(self, dur: int):
+        self.history_audio_slider.setRange(0, max(0, dur))
+        self.history_audio_slider.setEnabled(dur > 0)
+        self.history_total_time_lbl.setText(self._format_ms(dur))
+
+    def _on_history_audio_state_changed(self, state):
+        if state == QMediaPlayer.PlayingState:
+            self.history_audio_state_lbl.setText("Playing")
+            self.history_player_pause_btn.setText("Pause")
+        elif state == QMediaPlayer.PausedState:
+            self.history_audio_state_lbl.setText("Paused")
+            self.history_player_pause_btn.setText("Resume")
+        else:
+            self.history_audio_state_lbl.setText("Stopped")
+            self.history_player_pause_btn.setText("Pause")
+
+    def _on_history_audio_slider_pressed(self):
+        self._audio_slider_dragging = True
+
+    def _on_history_audio_slider_moved(self, val: int):
+        self.history_cur_time_lbl.setText(self._format_ms(val))
+
+    def _on_history_audio_slider_released(self):
+        self._audio_slider_dragging = False
+        self._audio_player.setPosition(self.history_audio_slider.value())
+
+    def _on_history_player_play_clicked(self):
+        if self._audio_player_scene_idx is None:
+            if not self._history_scene_audio_paths:
+                return
+            first_idx = sorted(self._history_scene_audio_paths.keys())[0]
+            ctrl = self._history_scene_audio_controls.get(first_idx)
+            if ctrl:
+                lbl, pause_btn = ctrl
+                self._play_history_audio(self._history_scene_audio_paths[first_idx], first_idx, lbl, pause_btn)
+            return
+
+        if self._audio_player.state() == QMediaPlayer.PausedState:
+            self._audio_player.play()
+            return
+
+        ctrl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
+        path = self._history_scene_audio_paths.get(self._audio_player_scene_idx, "")
+        if ctrl and path:
+            lbl, pause_btn = ctrl
+            self._play_history_audio(path, self._audio_player_scene_idx, lbl, pause_btn)
+
+    def _on_history_player_pause_clicked(self):
+        if self._audio_player_scene_idx is None:
+            return
+        ctrl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
+        if not ctrl:
+            return
+        lbl, pause_btn = ctrl
+        self._pause_resume_history_audio(self._audio_player_scene_idx, lbl, pause_btn)
+
+    def _on_history_player_stop_clicked(self):
+        if self._audio_player_scene_idx is None:
+            return
+        ctrl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
+        if not ctrl:
+            return
+        lbl, pause_btn = ctrl
+        self._stop_history_audio(self._audio_player_scene_idx, lbl, pause_btn)
+
+    def _show_history_image_preview(self, path: str):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Image Missing", "Image file not found.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Image Preview")
+        dlg.resize(960, 540)
+        layout = QVBoxLayout(dlg)
+        img_lbl = QLabel()
+        img_lbl.setAlignment(Qt.AlignCenter)
+        img_lbl.setStyleSheet("background:#11111b; border-radius:6px;")
+        pix = QPixmap(path)
+        img_lbl.setPixmap(pix.scaled(920, 500, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(img_lbl)
+        dlg.exec_()
+    def _play_history_audio(self, path: str, scene_idx: int, status_label: QLabel, pause_btn: QPushButton):
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Audio Missing", "Audio file not found.")
+            return
+        self._audio_player.stop()
+        self._audio_player.setMedia(QMediaContent(QUrl.fromLocalFile(os.path.abspath(path))))
+        self._audio_player_scene_idx = scene_idx
+        self._audio_player.play()
+        self.history_now_playing_lbl.setText(f"Now Playing: Scene {scene_idx + 1}")
+        status_label.setText("Playing")
+        status_label.setStyleSheet("color: #a6e3a1;")
+        pause_btn.setText("Pause")
+
+    def _pause_resume_history_audio(self, scene_idx: int, status_label: QLabel, pause_btn: QPushButton):
+        if self._audio_player_scene_idx != scene_idx:
+            status_label.setText("Play this scene first")
+            status_label.setStyleSheet("color: #f9e2af;")
+            return
+        state = self._audio_player.state()
+        if state == QMediaPlayer.PlayingState:
+            self._audio_player.pause()
+            status_label.setText("Paused")
+            status_label.setStyleSheet("color: #f9e2af;")
+            pause_btn.setText("Resume")
+        elif state == QMediaPlayer.PausedState:
+            self._audio_player.play()
+            status_label.setText("Playing")
+            status_label.setStyleSheet("color: #a6e3a1;")
+            pause_btn.setText("Pause")
+
+    def _stop_history_audio(self, scene_idx: int, status_label: QLabel, pause_btn: QPushButton):
+        if self._audio_player_scene_idx != scene_idx:
+            status_label.setText("Stopped")
+            status_label.setStyleSheet("color: #cdd6f4;")
+            return
+        self._audio_player.stop()
+        self._audio_player_scene_idx = None
+        self._reset_history_player_ui()
+        status_label.setText("Stopped")
+        status_label.setStyleSheet("color: #cdd6f4;")
+        pause_btn.setText("Pause")
 
     def _on_restitch_clicked(self):
         if not self._current_scenes:
@@ -1175,12 +1702,10 @@ class HistoryTab(QWidget):
             self._current_video_path = result_msg
             self.video_lbl.setText(f"✅ {os.path.basename(result_msg)}")
             self.video_lbl.setStyleSheet("color:#a6e3a1;")
-            self.play_video_btn.show()
-            # Wire view/folder buttons now that we have a confirmed path
             try:
                 self.view_video_btn.clicked.disconnect()
                 self.open_folder_btn.clicked.disconnect()
-            except (TypeError, AttributeError):
+            except TypeError:
                 pass
             self.view_video_btn.clicked.connect(
                 lambda: os.startfile(os.path.abspath(result_msg))
@@ -1190,6 +1715,7 @@ class HistoryTab(QWidget):
             )
             self.view_video_btn.show()
             self.open_folder_btn.show()
+            self.play_video_btn.hide()
         else:
             self.restitch_status.setText(f"❌ Failed: {result_msg[:120]}")
             self.restitch_status.setStyleSheet("color:#f38ba8;")
@@ -1459,3 +1985,4 @@ if __name__ == '__main__':
     window = AppWindow()
     window.show()
     sys.exit(app.exec_())
+
