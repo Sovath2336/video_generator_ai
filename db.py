@@ -95,3 +95,16 @@ def get_topic_detail(topic_id):
     scenes = c.fetchall()
     conn.close()
     return topic_row, scenes
+
+
+def delete_topic(topic_id):
+    """Delete a topic and all of its scenes."""
+    if not topic_id:
+        return
+
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute('DELETE FROM scenes WHERE topic_id = ?', (topic_id,))
+    c.execute('DELETE FROM topics WHERE id = ?', (topic_id,))
+    conn.commit()
+    conn.close()

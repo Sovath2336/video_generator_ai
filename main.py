@@ -2,6 +2,9 @@ import sys
 import os
 import re
 import ctypes
+import subprocess
+import tempfile
+import shutil
 from dotenv import load_dotenv
 
 # Load env variables and fix Google Credentials path to be relative to this file
@@ -25,7 +28,8 @@ from ai_generator import (
     generate_script_from_topic,
     analyze_text_to_scenes,
     generate_image_from_prompt,
-    generate_audio_from_text
+    generate_audio_from_text,
+    ensure_word_timing_data,
 )
 import db
 import moviepy.editor as mp
@@ -33,34 +37,124 @@ import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
 
+_GEMINI_VOICE_MAP = {
+    "puck": "puck",
+    "charon": "charon",
+    "fenrir": "fenrir",
+    "kore": "kore",
+    "aoede": "aoede",
+    "leda": "leda",
+}
+
+def parse_tts_selection(combo_text: str):
+    """Return (engine, voice_or_None) from a TTS combo label."""
+    if combo_text.startswith("Gemini"):
+        # Extract voice name between "— " and " ("
+        import re as _re
+        m = _re.search(r"—\s+(\w+)\s+\(", combo_text)
+        voice = m.group(1).lower() if m else "puck"
+        return "gemini", voice
+    return "google", None
+
 def make_safe_topic(topic: str) -> str:
     """Returns a filesystem-safe folder/file name derived from the topic."""
     safe = re.sub(r'[\\/:*?"<>|]', '_', topic or 'infographic').strip()
     return safe[:80]
 
+
+def make_scene_overlay_text(narration: str, visual: str = "") -> str:
+    """Create a short in-image label that represents the visual concept."""
+    visual_text = re.sub(r"\s+", " ", (visual or "")).strip()
+    narration_text = re.sub(r"\s+", " ", (narration or "")).strip()
+    visual_lower = visual_text.lower()
+    small_words = {"and", "or", "of", "the", "a", "an", "to", "in", "on", "for", "with"}
+
+    def _title_case(text: str) -> str:
+        words = text.split()
+        titled = []
+        for idx, word in enumerate(words):
+            low = word.lower()
+            titled.append(low if idx > 0 and low in small_words else low.capitalize())
+        return " ".join(titled)
+
+    def _compress(text: str, max_words: int = 4) -> str:
+        text = re.sub(r"\s+", " ", text).strip(' "\'').strip(".,;:-")
+        words = text.split()
+        if len(words) > max_words:
+            text = " ".join(words[:max_words])
+        return _title_case(text[:40].strip(' "\''))
+
+    def _from_visual(text: str) -> str:
+        cleaned = re.sub(
+            r"^(show|create|depict|illustrate|image of|scene of|visual of|picture of|portrait of)\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        cleaned = re.sub(
+            r"^(a|an|the)\s+((bold|cinematic|dramatic|vivid|vibrant|professional|warm|glowing|eye-catching|high-contrast|stylised|story-driven|detailed)\s+){0,4}",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        parts = re.split(r"(?<=[.!?])\s+|\s+[—-]\s+|;\s+|:\s+", cleaned)
+        headline = next((part.strip() for part in parts if part.strip()), cleaned)
+        headline = re.split(
+            r"\b(with|against|on|in|under|over|inside|outside|surrounded by|set against|featuring|showing)\b",
+            headline,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        return _compress(headline)
+
+    if any(marker in visual_lower for marker in ("subscribe button", "notification bell", "call to action")):
+        return "Like and Subscribe"
+
+    title_match = re.search(r'topic title\s+"([^"]+)"', visual_text, re.IGNORECASE)
+    if title_match:
+        return _title_case(title_match.group(1).strip()[:40])
+
+    if visual_text:
+        visual_headline = _from_visual(visual_text)
+        if visual_headline:
+            return visual_headline
+
+    if narration_text:
+        return _compress(narration_text)
+
+    return ""
+
 class ImageGenerationThread(QThread):
     finished = pyqtSignal(bool, str)
     
-    def __init__(self, prompt, output_path):
+    def __init__(self, prompt, output_path, overlay_text="", narration=""):
         super().__init__()
         self.prompt = prompt
         self.output_path = output_path
+        self.overlay_text = overlay_text
+        self.narration = narration
         
     def run(self):
-        success = generate_image_from_prompt(self.prompt, self.output_path)
+        success = generate_image_from_prompt(
+            self.prompt,
+            self.output_path,
+            self.overlay_text,
+            self.narration,
+        )
         self.finished.emit(success, self.output_path)
 
 class AudioGenerationThread(QThread):
     finished = pyqtSignal(bool, str)
-    
-    def __init__(self, text, output_path, engine="gemini"):
+
+    def __init__(self, text, output_path, engine="gemini", voice=None):
         super().__init__()
         self.text = text
         self.output_path = output_path
         self.engine = engine
-        
+        self.voice = voice
+
     def run(self):
-        success = generate_audio_from_text(self.text, self.output_path, self.engine)
+        success = generate_audio_from_text(self.text, self.output_path, self.engine, self.voice)
         self.finished.emit(success, self.output_path)
 
 class BulkGenerationThread(QThread):
@@ -71,11 +165,13 @@ class BulkGenerationThread(QThread):
     scene_progress = pyqtSignal(int, str, str)
     all_done = pyqtSignal(bool, str)
 
-    def __init__(self, scenes, topic_folder, tts_engine="gemini"):
+    def __init__(self, scenes, topic_folder, tts_engine="gemini", tts_voice=None, skip_existing=False):
         super().__init__()
         self.scenes = scenes
         self.topic_folder = topic_folder  # absolute path to topic sub-folder
         self.tts_engine = tts_engine
+        self.tts_voice = tts_voice
+        self.skip_existing = skip_existing
         self.is_cancelled = False
 
     def cancel(self):
@@ -95,29 +191,47 @@ class BulkGenerationThread(QThread):
             idx = i + 1
 
             # --- Image ---
-            self.scene_progress.emit(i, 'img', f'⏳ Generating image {idx}/{total}...')
             img_path = os.path.join(self.topic_folder, f"scene_{idx}.jpg")
-            img_ok = generate_image_from_prompt(scene.get('visual', ''), img_path)
-            if img_ok:
+            if self.skip_existing and os.path.exists(img_path):
                 scene['img_path'] = img_path
-                db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
-                self.scene_progress.emit(i, 'img', '✅ Image done')
+                self.scene_progress.emit(i, 'img', '⏭️ Image skipped (exists)')
             else:
-                failed.append(f"Scene {idx} Image")
-                self.scene_progress.emit(i, 'img', '❌ Image failed')
+                self.scene_progress.emit(i, 'img', f'⏳ Generating image {idx}/{total}...')
+                img_ok = generate_image_from_prompt(
+                    scene.get('visual', ''),
+                    img_path,
+                    make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', '')),
+                    scene.get('narration', ''),
+                )
+                if img_ok:
+                    scene['img_path'] = img_path
+                    db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
+                    self.scene_progress.emit(i, 'img', '✅ Image done')
+                else:
+                    failed.append(f"Scene {idx} Image")
+                    self.scene_progress.emit(i, 'img', '❌ Image failed')
 
             # --- Audio ---
-            self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {idx}/{total}...')
             audio_ext = "wav" if self.tts_engine == "gemini" else "mp3"
             aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{audio_ext}")
-            aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path, self.tts_engine)
-            if aud_ok:
-                scene['audio_path'] = aud_path
-                db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
-                self.scene_progress.emit(i, 'aud', '✅ Audio done')
+            # Also check the alternate extension in case a different engine was used before
+            alt_ext = "mp3" if audio_ext == "wav" else "wav"
+            alt_aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{alt_ext}")
+            existing_on_disk = os.path.exists(aud_path) or os.path.exists(alt_aud_path)
+            if self.skip_existing and existing_on_disk:
+                actual_path = aud_path if os.path.exists(aud_path) else alt_aud_path
+                scene['audio_path'] = actual_path
+                self.scene_progress.emit(i, 'aud', '⏭️ Audio skipped (exists)')
             else:
-                failed.append(f"Scene {idx} Audio")
-                self.scene_progress.emit(i, 'aud', '❌ Audio failed')
+                self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {idx}/{total}...')
+                aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path, self.tts_engine, self.tts_voice)
+                if aud_ok:
+                    scene['audio_path'] = aud_path
+                    db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
+                    self.scene_progress.emit(i, 'aud', '✅ Audio done')
+                else:
+                    failed.append(f"Scene {idx} Audio")
+                    self.scene_progress.emit(i, 'aud', '❌ Audio failed')
 
         if failed:
             self.all_done.emit(False, f"Completed with failures: {', '.join(failed)}")
@@ -129,90 +243,438 @@ class VideoStitchingThread(QThread):
     progress_pct = pyqtSignal(int)      # 0..100
     finished = pyqtSignal(bool, str)
 
-    PAUSE_DURATION = 0.4  # seconds of freeze between scenes
+    PAUSE_DURATION = 1.5  # seconds of freeze between scenes
     FPS = 24
+    OUTPUT_W = 1920
+    OUTPUT_H = 1080
+    SAMPLE_RATE = 44100  # normalise all audio to this rate
+    MAX_ZOOM = 1.08
 
     def __init__(self, scenes, output_path):
         super().__init__()
         self.scenes = scenes
         self.output_path = output_path
 
-    def run(self):
-        try:
-            total = len(self.scenes)
-            clips = []
+    # ── helpers ────────────────────────────────────────────────────────────────
 
-            self.progress_msg.emit(f"Building {total} scene clips...")
-            self.progress_pct.emit(0)
+    @staticmethod
+    def _escape_drawtext_value(text: str) -> str:
+        """Escape characters that are special inside ffmpeg drawtext option values."""
+        return (
+            text
+            .replace("\\", "\\\\")
+            .replace("'",  "\u2019")   # curly apostrophe avoids quote issues
+            .replace(":",  "\\:")
+            .replace(",",  "\\,")
+            .replace("%",  "%%")
+            .replace("\n", r"\n")
+        )
 
-            for i, scene in enumerate(self.scenes):
-                img_path = scene.get('img_path')
-                aud_path = scene.get('audio_path')
+    @staticmethod
+    def _escape_drawtext_path(path: str) -> str:
+        """Escape a filesystem path for ffmpeg drawtext textfile/fontfile options."""
+        return (
+            path.replace("\\", "/")
+            .replace(":", "\\:")
+            .replace("'", r"\'")
+        )
 
-                if not img_path or not os.path.exists(img_path):
-                    self.finished.emit(False, f"Missing Image for Scene {i+1}.")
-                    return
-                if not aud_path or not os.path.exists(aud_path):
-                    self.finished.emit(False, f"Missing Audio for Scene {i+1}.")
-                    return
+    @staticmethod
+    def _find_subtitle_font() -> str:
+        """Prefer a bold Windows font so subtitles render larger and heavier."""
+        candidates = [
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arialbd.ttf"),
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeuib.ttf"),
+            os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "calibrib.ttf"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return ""
 
-                self.progress_msg.emit(f"Scene {i+1}/{total} — adding motion FX...")
-                pct = int((i / total) * 60)  # first 60% of progress bar = clip building
-                self.progress_pct.emit(pct)
+    @staticmethod
+    def _fallback_subtitle_chunks(narration: str, duration: float) -> list:
+        """
+        Guaranteed subtitle fallback for any non-empty narration.
+        Keeps punctuation from the script and distributes chunks evenly.
+        """
+        narration = (narration or "").strip()
+        if not narration or duration <= 0:
+            return []
 
-                audio_clip = mp.AudioFileClip(aud_path)
-                dur = audio_clip.duration
+        word_matches = list(re.finditer(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*", narration))
+        if not word_matches:
+            return [{"text": narration, "start_sec": 0.0, "end_sec": duration}]
 
-                # Cinematic slow zoom-in (1.0x → 1.05x)
-                img_clip = mp.ImageClip(img_path).set_duration(dur)
-                img_zoomed = img_clip.resize(lambda t: 1.0 + 0.05 * (t / dur))
-                scene_clip = (
-                    mp.CompositeVideoClip([img_zoomed.set_pos('center')], size=img_clip.size)
-                    .set_duration(dur)
-                    .set_audio(audio_clip)
-                )
+        chunk_ranges = []
+        for i in range(0, len(word_matches), 10):
+            next_index = i + 10
+            start_char = 0 if i == 0 else word_matches[i].start()
+            end_char = len(narration) if next_index >= len(word_matches) else word_matches[next_index].start()
+            chunk_text = narration[start_char:end_char].strip()
+            if chunk_text:
+                chunk_ranges.append(chunk_text)
 
-                # Add pause — freeze last frame of scene (silent) for natural breathing room
-                freeze = mp.ImageClip(img_path).set_duration(self.PAUSE_DURATION)
+        if not chunk_ranges:
+            return [{"text": narration, "start_sec": 0.0, "end_sec": duration}]
 
-                clips.append(scene_clip)
-                clips.append(freeze)  # pause after EVERY scene including the last
+        step = duration / len(chunk_ranges)
+        return [
+            {
+                "text": text,
+                "start_sec": step * idx,
+                "end_sec": duration if idx == len(chunk_ranges) - 1 else step * (idx + 1),
+            }
+            for idx, text in enumerate(chunk_ranges)
+        ]
 
-            self.progress_msg.emit("Applying crossfade transitions...")
-            self.progress_pct.emit(62)
+    @staticmethod
+    def _subtitle_chunks(narration: str, word_timings: list, duration: float) -> list:
+        """
+        Group subtitles in chunks of up to 10 spoken words while preserving
+        the original punctuation from the script text.
+        """
+        narration = narration or ""
+        if not narration.strip():
+            return []
+        if not word_timings:
+            return VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
 
-            crossfade = 0.5
-            # Interleave: scene -> pause -> scene -> pause ...
-            # Apply crossfade to non-pause clips only (pause clips are silent/simple)
-            final_clips = [clips[0]]  # first scene clip (no crossfade on very first)
-            for j, c in enumerate(clips[1:], start=1):
-                # Only crossfade on actual scene clips, not freeze frames
-                if j % 2 == 0:  # even indices = scene clips
-                    final_clips.append(c.crossfadein(crossfade))
-                else:           # odd indices = freeze pauses
-                    final_clips.append(c)
+        word_matches = list(re.finditer(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*", narration))
+        if len(word_matches) != len(word_timings):
+            chunks = [
+                {
+                    "text": " ".join(word.get("text", "") for word in word_timings[i:i + 10]).strip(),
+                    "start_sec": max(0.0, float(word_timings[i].get("start_sec", 0.0))),
+                    "end_sec": (
+                        duration
+                        if i + 10 >= len(word_timings)
+                        else max(0.0, float(word_timings[i + 10].get("start_sec", duration)))
+                    ),
+                }
+                for i in range(0, len(word_timings), 10)
+            ]
+            return [chunk for chunk in chunks if chunk.get("text")] or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
 
-            self.progress_msg.emit("Concatenating timeline...")
-            self.progress_pct.emit(70)
-            final_video = mp.concatenate_videoclips(final_clips, padding=-crossfade, method="compose")
+        chunks = []
+        for i in range(0, len(word_timings), 10):
+            next_index = i + 10
+            start_char = 0 if i == 0 else word_matches[i].start()
+            end_char = len(narration) if next_index >= len(word_matches) else word_matches[next_index].start()
+            chunk_text = narration[start_char:end_char].strip()
+            if not chunk_text:
+                continue
+            chunks.append(
+                {
+                    "text": chunk_text,
+                    "start_sec": max(0.0, float(word_timings[i].get("start_sec", 0.0))),
+                    "end_sec": (
+                        duration
+                        if next_index >= len(word_timings)
+                        else max(0.0, float(word_timings[next_index].get("start_sec", duration)))
+                    ),
+                }
+            )
+        return chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
 
-            self.progress_msg.emit(f"Encoding video (ultrafast)...")
-            self.progress_pct.emit(75)
+    @classmethod
+    def _subtitle_vf(cls, narration: str, word_timings: list, duration: float, subtitle_dir: str, scene_idx: int) -> str:
+        """
+        Build chained ffmpeg drawtext filters from aligned word timings.
+        Each subtitle group shows at most 10 words and advances using the
+        actual spoken-word timing data for that scene.
+        """
+        if not narration.strip() or duration <= 0:
+            return ""
 
-            final_video.write_videofile(
-                self.output_path,
-                fps=self.FPS,
-                codec="libx264",
-                audio_codec="aac",
-                preset="ultrafast",
-                threads=4,
-                logger=None
+        os.makedirs(subtitle_dir, exist_ok=True)
+        chunks = cls._subtitle_chunks(narration, word_timings, duration)
+        if not chunks:
+            chunks = cls._fallback_subtitle_chunks(narration, duration)
+        if not chunks:
+            return ""
+        font_path = cls._find_subtitle_font()
+        filters = []
+        for idx, chunk in enumerate(chunks):
+            chunk_text = chunk.get("text", "").strip()
+            if not chunk_text:
+                continue
+            start_time = max(0.0, float(chunk.get("start_sec", 0.0)))
+            end_time = duration if idx == len(chunks) - 1 else max(start_time, float(chunk.get("end_sec", duration)))
+            enable_expr = (
+                f"gte(t,{start_time:.4f})"
+                if idx == len(chunks) - 1
+                else f"gte(t,{start_time:.4f})*lt(t,{end_time:.4f})"
             )
 
-            self.progress_pct.emit(100)
-            self.finished.emit(True, self.output_path)
+            subtitle_path = os.path.join(subtitle_dir, f"scene_{scene_idx + 1:03d}_{idx:03d}.txt")
+            with open(subtitle_path, "w", encoding="utf-8") as fh:
+                fh.write(chunk_text)
+
+            drawtext_parts = [
+                "drawtext=",
+                f"textfile='{cls._escape_drawtext_path(subtitle_path)}':",
+            ]
+            if font_path:
+                drawtext_parts.append(f"fontfile='{cls._escape_drawtext_path(font_path)}':")
+            filters.append(
+                "".join(drawtext_parts)
+                + f"fontsize=42:"
+                f"fontcolor=white:"
+                f"x=(w-text_w)/2:"
+                f"y=h-text_h-80:"
+                f"line_spacing=8:"
+                f"borderw=3:"
+                f"bordercolor=0x000000E0:"
+                f"box=1:"
+                f"boxcolor=0x000000C8:"
+                f"boxborderw=28:"
+                f"enable='{cls._escape_drawtext_value(enable_expr)}'"
+            )
+
+        return ",".join(filters)
+
+    def _find_ffmpeg(self) -> str:
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return "ffmpeg"
+
+    def _scene_motion_filters(self, zoom_duration: float, hold_duration: float = 0.0) -> list:
+        """
+        Build a smoother center-zoom using crop+scale.
+        Hold the final zoom level steady before cutting to the next scene.
+        This avoids the jittery stepping produced by the previous zoompan filter.
+        """
+        safe_duration = max(zoom_duration, 0.001)
+        zoom_delta = self.MAX_ZOOM - 1.0
+        if hold_duration > 0:
+            zoom_expr = (
+                f"if(lt(t\\,{safe_duration:.4f}),"
+                f"1+{zoom_delta:.4f}*(t/{safe_duration:.4f}),"
+                f"{self.MAX_ZOOM:.4f})"
+            )
+        else:
+            zoom_expr = f"1+{zoom_delta:.4f}*(t/{safe_duration:.4f})"
+        return [
+            f"scale={self.OUTPUT_W}:{self.OUTPUT_H}:force_original_aspect_ratio=decrease",
+            f"pad={self.OUTPUT_W}:{self.OUTPUT_H}:(ow-iw)/2:(oh-ih)/2",
+            f"scale=w='iw*({zoom_expr})':h='ih*({zoom_expr})':eval=frame",
+            f"crop={self.OUTPUT_W}:{self.OUTPUT_H}:(iw-{self.OUTPUT_W})/2:(ih-{self.OUTPUT_H})/2:exact=1",
+            "setsar=1",
+        ]
+
+    def _freeze_motion_filters(self) -> list:
+        """Hold the final zoom level steady during the pause clip."""
+        return [
+            f"scale={self.OUTPUT_W}:{self.OUTPUT_H}:force_original_aspect_ratio=decrease",
+            f"pad={self.OUTPUT_W}:{self.OUTPUT_H}:(ow-iw)/2:(oh-ih)/2",
+            f"scale={int(round(self.OUTPUT_W * self.MAX_ZOOM))}:{int(round(self.OUTPUT_H * self.MAX_ZOOM))}",
+            f"crop={self.OUTPUT_W}:{self.OUTPUT_H}:(iw-{self.OUTPUT_W})/2:(ih-{self.OUTPUT_H})/2:exact=1",
+            "setsar=1",
+        ]
+
+    def _probe_duration(self, ffmpeg_path: str, media_path: str) -> float:
+        """Return media duration in seconds via ffprobe, falling back to moviepy."""
+        ffprobe = os.path.join(
+            os.path.dirname(ffmpeg_path),
+            "ffprobe" + (".exe" if os.name == "nt" else ""),
+        )
+        if not os.path.exists(ffprobe):
+            ffprobe = "ffprobe"
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", media_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            return float(r.stdout.strip())
+        except Exception:
+            clip = mp.AudioFileClip(media_path)
+            dur = clip.duration
+            clip.close()
+            return dur
+
+    # ── main entry point ───────────────────────────────────────────────────────
+
+    def run(self):
+        temp_dir = tempfile.mkdtemp(prefix="vgen_")
+        try:
+            self._encode(temp_dir)
         except Exception as e:
             self.finished.emit(False, str(e))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # ── real-time ffmpeg runner ────────────────────────────────────────────────
+
+    def _run_ffmpeg(
+        self,
+        cmd: list,
+        total_frames: int,
+        pct_start: int,
+        pct_end: int,
+        label: str,
+    ) -> tuple:
+        """
+        Run an ffmpeg command and stream real-time frame progress.
+        Injects -progress pipe:1 before the output path (last arg).
+        Returns (success: bool, error_text: str).
+        """
+        import threading
+
+        # Inject progress reporting flags just before the output path
+        progress_cmd = (
+            cmd[:-1]
+            + ["-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+            + [cmd[-1]]
+        )
+
+        proc = subprocess.Popen(
+            progress_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        # Drain stderr in background so it never blocks stdout reads
+        stderr_buf = []
+        def _drain(pipe):
+            for line in pipe:
+                stderr_buf.append(line)
+        drain_thread = threading.Thread(target=_drain, args=(proc.stderr,), daemon=True)
+        drain_thread.start()
+
+        # Read ffmpeg's structured progress from stdout
+        frame = 0
+        for raw in proc.stdout:
+            line = raw.strip()
+            if line.startswith("frame="):
+                try:
+                    frame = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+                if total_frames > 0:
+                    ratio = min(frame / total_frames, 1.0)
+                    pct = pct_start + int(ratio * (pct_end - pct_start))
+                    self.progress_pct.emit(pct)
+                    self.progress_msg.emit(
+                        f"{label}  {int(ratio * 100)}%  ({frame}/{total_frames} frames)"
+                    )
+
+        proc.wait()
+        drain_thread.join(timeout=5)
+        err = "".join(stderr_buf)
+        if proc.returncode != 0:
+            return False, err[-800:]
+        return True, ""
+
+    # ── encode pipeline ────────────────────────────────────────────────────────
+
+    def _encode(self, temp_dir: str):
+        total = len(self.scenes)
+        ffmpeg = self._find_ffmpeg()
+        threads = str(os.cpu_count() or 4)
+        fade_d = 0.5  # seconds of fade-in/out baked into every clip
+
+        clip_paths: list = []
+        subtitle_dir = os.path.join(temp_dir, "subtitles")
+
+        # Progress: 0-90% for per-scene ffmpeg calls, 90-100% for assembly.
+        total_calls = max(total, 1)
+
+        def call_pct(call_idx):
+            s = int(call_idx / total_calls * 90)
+            e = int((call_idx + 1) / total_calls * 90)
+            return s, e
+
+        # ── Step 1: encode each scene clip + freeze, fades baked in ───────────
+        for i, scene in enumerate(self.scenes):
+            img_path = scene.get("img_path")
+            aud_path = scene.get("audio_path")
+
+            if not img_path or not os.path.exists(img_path):
+                self.finished.emit(False, f"Missing image for scene {i+1}.")
+                return
+            if not aud_path or not os.path.exists(aud_path):
+                self.finished.emit(False, f"Missing audio for scene {i+1}.")
+                return
+
+            dur = self._probe_duration(ffmpeg, aud_path)
+            total_dur = dur + self.PAUSE_DURATION
+            frames = max(1, int(round(total_dur * self.FPS)))
+
+            # ?? scene clip: zoom, hold final frame, subtitle, fade in/out ??
+            narration = scene.get("narration", "")
+            word_timings = []
+            if narration.strip():
+                self.progress_msg.emit(f"Scene {i+1}/{total} - aligning subtitles...")
+                try:
+                    word_timings = ensure_word_timing_data(narration, aud_path)
+                except Exception as e:
+                    self.finished.emit(False, f"Scene {i+1} subtitle alignment failed:\n{e}")
+                    return
+                if word_timings is None:
+                    self.finished.emit(False, f"Scene {i+1} subtitle alignment failed.")
+                    return
+
+            subtitle_vf = self._subtitle_vf(narration, word_timings, dur, subtitle_dir, i)
+            scene_filters = self._scene_motion_filters(dur, self.PAUSE_DURATION)
+            if subtitle_vf:
+                scene_filters.append(subtitle_vf)
+            scene_filters.append(f"fade=t=in:st=0:d={fade_d}:color=black")
+            pause_fade_start = max(0.0, total_dur - fade_d)
+            scene_filters.append(f"fade=t=out:st={pause_fade_start:.4f}:d={fade_d}:color=black")
+            vf_scene = ",".join(scene_filters)
+            af_scene = f"apad=pad_dur={self.PAUSE_DURATION:.4f},afade=t=in:st=0:d={fade_d}"
+            clip_path = os.path.join(temp_dir, f"s{i:03d}.mp4")
+            ps, pe = call_pct(i)
+            ok, err = self._run_ffmpeg([
+                ffmpeg, "-y",
+                "-loop", "1", "-framerate", str(self.FPS), "-i", img_path,
+                "-i", aud_path,
+                "-vf", vf_scene,
+                "-af", af_scene,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "192k", "-ar", str(self.SAMPLE_RATE),
+                "-t", f"{total_dur:.4f}",
+                "-pix_fmt", "yuv420p",
+                "-threads", threads,
+                clip_path,
+            ], frames, ps, pe, f"Scene {i+1}/{total} ? encoding")
+            if not ok:
+                self.finished.emit(False, f"Scene {i+1} encode failed:\n{err}")
+                return
+            clip_paths.append(clip_path)
+
+        # ── Step 2: assemble with concat demuxer + stream copy ─────────────────
+        # All clips share the same codec/resolution/fps/sample-rate so -c copy is safe.
+        # Stream copy never re-encodes → structurally valid output, no corruption.
+        self.progress_msg.emit("Assembling final video...")
+        self.progress_pct.emit(92)
+
+        concat_list = os.path.join(temp_dir, "playlist.txt")
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for p in clip_paths:
+                f.write(f"file '{p.replace(chr(92), '/')}'\n")
+
+        r = subprocess.run([
+            ffmpeg, "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_list,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            self.output_path,
+        ], capture_output=True)
+
+        if r.returncode != 0:
+            self.finished.emit(False,
+                f"Assembly failed:\n{r.stderr.decode(errors='replace')[-1000:]}")
+            return
+
+        self.progress_pct.emit(100)
+        self.finished.emit(True, self.output_path)
 
 class ScriptGenerationThread(QThread):
     chunk_received = pyqtSignal(str)
@@ -286,7 +748,7 @@ class ScriptTab(QWidget):
 
         # --- Analyze Text Panel ---
         analyze_frame = QFrame()
-        analyze_frame.setStyleSheet("background-color: #2b2b36; border-radius: 8px; padding: 8px;")
+        analyze_frame.setStyleSheet("QFrame { background-color: #2b2b36; border-radius: 8px; padding: 8px; }")
         analyze_frame_layout = QVBoxLayout(analyze_frame)
         analyze_frame_layout.setSpacing(6)
 
@@ -330,7 +792,9 @@ class ScriptTab(QWidget):
         # Additional Buttons
         btn_layout = QHBoxLayout()
         self.enhance_btn = QPushButton("🪄 Enhance Script")
+        self.enhance_btn.setProperty("class", "secondary-button")
         self.split_btn = QPushButton("✂️ Split into Scenes")
+        self.split_btn.setProperty("class", "primary-button")
         self.split_btn.clicked.connect(self.parse_and_go_next)
         btn_layout.addWidget(self.enhance_btn)
         btn_layout.addWidget(self.split_btn)
@@ -453,8 +917,16 @@ class StoryboardTab(QWidget):
         label = QLabel("Storyboard (Generate Image & TTS Audio)")
         label.setProperty("class", "h2")
         self.tts_engine_combo = QComboBox()
-        self.tts_engine_combo.addItems(["Gemini (Puck Voice)", "Google Cloud (Journey-D)"])
-        self.tts_engine_combo.setToolTip("Select the Text-to-Speech Engine for audio generation.")
+        self.tts_engine_combo.addItems([
+            "Gemini — Puck (Male)",
+            "Gemini — Charon (Male)",
+            "Gemini — Fenrir (Male)",
+            "Gemini — Kore (Female)",
+            "Gemini — Aoede (Female)",
+            "Gemini — Leda (Female)",
+            "Google Cloud (Journey-D)",
+        ])
+        self.tts_engine_combo.setToolTip("Select the Text-to-Speech voice. Gemini voices are locked to a single gender per call.")
         
         self.generate_all_btn = QPushButton("⚡ Auto-Generate All Scenes")
         self.generate_all_btn.setProperty("class", "success-button")
@@ -488,6 +960,7 @@ class StoryboardTab(QWidget):
         # Bottom nav
         nav_layout = QHBoxLayout()
         self.back_btn = QPushButton("⬅ Back to Script")
+        self.back_btn.setProperty("class", "secondary-button")
         self.back_btn.clicked.connect(self.back_requested.emit)
         
         self.next_btn = QPushButton("Next: Export Video ➔")
@@ -522,7 +995,7 @@ class StoryboardTab(QWidget):
         
         for i, scene in enumerate(scenes):
             card = QFrame()
-            card.setStyleSheet("background-color: #2b2b36; border-radius: 8px; padding: 10px;")
+            card.setStyleSheet("QFrame { background-color: #2b2b36; border-radius: 8px; padding: 10px; }")
             card_main_layout = QHBoxLayout() # Horizontal wrap to put image on the right
             
             # Left side: Text and Buttons
@@ -586,14 +1059,24 @@ class StoryboardTab(QWidget):
             card_main_layout.addLayout(right_layout, stretch=1)
             
             # Capture the scope for the handlers
-            def create_img_handler(idx=i, prompt=scene['visual'], lbl=status_lbl_img, btn=gen_img_btn, p_lbl=img_preview, view_btn=view_img_btn, tdir=self._topic_folder):
+            def create_img_handler(
+                idx=i,
+                prompt=scene['visual'],
+                overlay_text=make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', '')),
+                narration=scene.get('narration', ''),
+                lbl=status_lbl_img,
+                btn=gen_img_btn,
+                p_lbl=img_preview,
+                view_btn=view_img_btn,
+                tdir=self._topic_folder,
+            ):
                 os.makedirs(tdir, exist_ok=True)
                 out_path = os.path.join(tdir, f"scene_{idx+1}.jpg")
                 btn.setEnabled(False)
                 lbl.setText("⏳ Generating Image...")
                 lbl.setStyleSheet("color: #f9e2af;") # Yellow
                 
-                thread = ImageGenerationThread(prompt, out_path)
+                thread = ImageGenerationThread(prompt, out_path, overlay_text, narration)
                 # Store reference so it is not garbage collected
                 setattr(self, f"img_thread_{idx}", thread)
                 
@@ -621,14 +1104,14 @@ class StoryboardTab(QWidget):
 
             def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn, tdir=self._topic_folder):
                 os.makedirs(tdir, exist_ok=True)
-                audio_ext = "wav" if "Gemini" in self.tts_engine_combo.currentText() else "mp3"
+                engine, voice = parse_tts_selection(self.tts_engine_combo.currentText())
+                audio_ext = "wav" if engine == "gemini" else "mp3"
                 out_path = os.path.join(tdir, f"scene_{idx+1}.{audio_ext}")
                 btn.setEnabled(False)
                 lbl.setText("⏳ Generating Audio...")
                 lbl.setStyleSheet("color: #f9e2af;")
-                
-                engine = "gemini" if "Gemini" in self.tts_engine_combo.currentText() else "google"
-                thread = AudioGenerationThread(text, out_path, engine)
+
+                thread = AudioGenerationThread(text, out_path, engine, voice)
                 setattr(self, f"aud_thread_{idx}", thread)
                 
                 def on_finish(success, path):
@@ -663,20 +1146,46 @@ class StoryboardTab(QWidget):
 
         def trigger_all():
             """Spawn a sequential BulkGenerationThread that processes each scene in order."""
+            has_existing_assets = any(
+                (sc.get('img_path') and os.path.exists(sc['img_path']))
+                or (sc.get('audio_path') and os.path.exists(sc['audio_path']))
+                for sc in scenes
+            )
+            skip_existing = False
+
+            if has_existing_assets:
+                # Ask whether to skip already-generated assets or redo everything
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("Generate Assets")
+                msg_box.setText("What would you like to generate?")
+                msg_box.setInformativeText(
+                    "• <b>Missing only</b> — skip scenes that already have an image and audio file.<br>"
+                    "• <b>Regenerate all</b> — overwrite every image and audio, even if they exist."
+                )
+                btn_missing = msg_box.addButton("Missing only", QMessageBox.AcceptRole)
+                btn_all     = msg_box.addButton("Regenerate all", QMessageBox.DestructiveRole)
+                msg_box.addButton(QMessageBox.Cancel)
+                msg_box.exec_()
+
+                clicked = msg_box.clickedButton()
+                if clicked is None or clicked == msg_box.button(QMessageBox.Cancel):
+                    return
+                skip_existing = (clicked == btn_missing)
+
             self.generate_all_btn.setEnabled(False)
             self.generate_all_btn.setText("⏳ Generating...")
             self.stop_btn.show()
             self.stop_btn.setEnabled(True)
             self.stop_btn.setText("⏹️ Stop")
-            
-            engine = "gemini" if "Gemini" in self.tts_engine_combo.currentText() else "google"
+
+            engine, voice = parse_tts_selection(self.tts_engine_combo.currentText())
 
             # Build a quick lookup from scene index to its UI labels
             status_map = {}  # index -> (img_lbl, aud_lbl, img_preview_lbl, view_img_btn, play_aud_btn)
             for j, (sc, lbl_img, lbl_aud, p_lbl, v_btn, pl_btn) in enumerate(scene_ui_refs):
                 status_map[j] = (lbl_img, lbl_aud, p_lbl, v_btn, pl_btn)
 
-            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine)
+            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine, voice, skip_existing)
             setattr(self, '_bulk_thread', bulk_thread)
 
             try:
@@ -694,25 +1203,37 @@ class StoryboardTab(QWidget):
             def on_scene_progress(idx, asset_type, msg):
                 if idx not in status_map:
                     return
-                lbl_img, lbl_aud, p_lbl, v_btn, pl_btn = status_map[idx]
-                if asset_type == 'img':
-                    lbl_img.setText(msg)
-                    lbl_img.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
-                    if '✅' in msg:
-                        path = scenes[idx].get('img_path', '')
-                        if path and os.path.exists(path):
-                            pix = QPixmap(path)
-                            p_lbl.setPixmap(pix.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
-                            v_btn.show()
-                            v_btn.clicked.connect(lambda _, p=path: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
+                total_steps = max(1, len(scenes) * 2)
+                step_idx = idx * 2 + (1 if asset_type == 'aud' else 0)
+                msg_l = (msg or "").lower()
+                if 'done' in msg_l or 'skipped' in msg_l:
+                    completed_steps = step_idx + 1
                 else:
-                    lbl_aud.setText(msg)
-                    lbl_aud.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
-                    if '✅' in msg:
-                        path = scenes[idx].get('audio_path', '')
-                        if path:
-                            pl_btn.show()
-                            pl_btn.clicked.connect(lambda _, p=path: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
+                    completed_steps = step_idx
+                pct = min(100, max(0, int(round(completed_steps / total_steps * 100))))
+                self.generate_all_btn.setText(f"⏳ Generating... {pct}%")
+                lbl_img, lbl_aud, p_lbl, v_btn, pl_btn = status_map[idx]
+                try:
+                    if asset_type == 'img':
+                        lbl_img.setText(msg)
+                        lbl_img.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
+                        if '✅' in msg:
+                            path = scenes[idx].get('img_path', '')
+                            if path and os.path.exists(path):
+                                pix = QPixmap(path)
+                                p_lbl.setPixmap(pix.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                                v_btn.show()
+                                v_btn.clicked.connect(lambda _, p=path: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
+                    else:
+                        lbl_aud.setText(msg)
+                        lbl_aud.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
+                        if '✅' in msg:
+                            path = scenes[idx].get('audio_path', '')
+                            if path:
+                                pl_btn.show()
+                                pl_btn.clicked.connect(lambda _, p=path: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
+                except RuntimeError:
+                    pass
 
             def on_all_done(all_ok, msg):
                 self.generate_all_btn.setEnabled(True)
@@ -743,6 +1264,7 @@ class ExportTab(QWidget):
         title = QLabel("🎬 Export Video")
         title.setProperty("class", "h2")
         self.back_btn = QPushButton("⬅ Back to Storyboard")
+        self.back_btn.setProperty("class", "secondary-button")
         self.back_btn.clicked.connect(self.back_requested.emit)
         header_row.addWidget(title)
         header_row.addStretch()
@@ -768,7 +1290,7 @@ class ExportTab(QWidget):
 
         # ── Status & Progress ────────────────────────────────────────────
         status_frame = QFrame()
-        status_frame.setStyleSheet("background:#2b2b36; border-radius:8px; padding:12px;")
+        status_frame.setStyleSheet("QFrame { background:#2b2b36; border-radius:8px; padding:12px; }")
         sf_layout = QVBoxLayout(status_frame)
 
         self.status_lbl = QLabel("Ready to export once all assets are generated.",
@@ -936,17 +1458,27 @@ class HistoryTab(QWidget):
         refresh_btn.clicked.connect(self.load_history)
         title_row.addWidget(title)
         title_row.addStretch()
+        self.delete_topic_btn = QPushButton("Delete")
+        self.delete_topic_btn.setProperty("class", "danger-button")
+        self.delete_topic_btn.setEnabled(False)
+        self.delete_topic_btn.clicked.connect(self._delete_current_topic)
+        title_row.addWidget(self.delete_topic_btn)
         title_row.addWidget(refresh_btn)
         root_layout.addLayout(title_row)
 
-        # Splitter: left = list, right = detail
+        # 3-column splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.setStyleSheet("QSplitter::handle { background: #313244; width: 2px; }")
 
-        # ---- LEFT PANEL: Topic List ----
+        # ── COL 1: Topic list ──────────────────────────────────────────────────
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
+        list_label = QLabel("📋 Topics")
+        list_label.setProperty("class", "h2")
+        left_layout.addWidget(list_label)
 
         self.topic_list = QListWidget()
         self.topic_list.setStyleSheet("""
@@ -957,49 +1489,54 @@ class HistoryTab(QWidget):
         """)
         self.topic_list.currentRowChanged.connect(self._on_topic_selected)
         left_layout.addWidget(self.topic_list)
-        left_panel.setMinimumWidth(240)
+        left_panel.setMinimumWidth(200)
 
-        # ---- RIGHT PANEL: Detail view ----
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(6, 0, 0, 0)
-        right_layout.setSpacing(10)
+        # ── COL 2: Script ──────────────────────────────────────────────────────
+        mid_panel = QWidget()
+        mid_layout = QVBoxLayout(mid_panel)
+        mid_layout.setContentsMargins(6, 0, 6, 0)
+        mid_layout.setSpacing(8)
 
-        # ---- Right panel widgets (defined first, added to layout at the end) ----
-
-        self.detail_header = QLabel("Select a topic on the left to view details.")
+        self.detail_header = QLabel("Select a topic to view details.")
         self.detail_header.setProperty("class", "h2")
         self.detail_header.setWordWrap(True)
+        mid_layout.addWidget(self.detail_header)
 
-        # Final video row
+        # Video action row
+        vid_layout = QVBoxLayout()
         vid_row = QHBoxLayout()
-        self.video_lbl = QLabel("No final video found for this topic.")
+        self.video_lbl = QLabel("No final video yet.")
         self.video_lbl.setStyleSheet("color: #585b70;")
-        self.play_video_btn = QPushButton("▶️  Play Final Video")
+        self.video_lbl.setWordWrap(True)
+        vid_layout.addWidget(self.video_lbl)
+        self.play_video_btn = QPushButton("▶️ Play")
         self.play_video_btn.setProperty("class", "success-button")
         self.play_video_btn.hide()
         self.play_video_btn.clicked.connect(self._play_video)
-        self.restitch_btn = QPushButton("🔁 Re-Stitch Video")
+        self.restitch_btn = QPushButton("🔁 Re-Stitch")
         self.restitch_btn.setProperty("class", "primary-button")
         self.restitch_btn.hide()
         self.restitch_btn.clicked.connect(self._on_restitch_clicked)
-        self.view_video_btn = QPushButton("🎬 View Video")
+        self.view_video_btn = QPushButton("🎬 View")
         self.view_video_btn.setProperty("class", "success-button")
         self.view_video_btn.hide()
-        self.open_folder_btn = QPushButton("📂 Open Folder")
+        self.open_folder_btn = QPushButton("📂 Folder")
         self.open_folder_btn.setProperty("class", "secondary-button")
         self.open_folder_btn.hide()
-        vid_row.addWidget(self.video_lbl)
-        vid_row.addStretch()
         vid_row.addWidget(self.restitch_btn)
         vid_row.addWidget(self.view_video_btn)
         vid_row.addWidget(self.open_folder_btn)
         vid_row.addWidget(self.play_video_btn)
+        vid_row.addStretch()
+        vid_layout.addLayout(vid_row)
+        mid_layout.addLayout(vid_layout)
 
         self.restitch_status = QLabel("")
         self.restitch_status.setAlignment(Qt.AlignCenter)
         self.restitch_status.setWordWrap(True)
         self.restitch_status.hide()
+        mid_layout.addWidget(self.restitch_status)
+
         self.restitch_progress = QProgressBar()
         self.restitch_progress.setRange(0, 100)
         self.restitch_progress.setFixedHeight(8)
@@ -1010,43 +1547,20 @@ class HistoryTab(QWidget):
                 stop:0 #2563eb, stop:1 #a855f7); border-radius:4px; }
         """)
         self.restitch_progress.hide()
+        mid_layout.addWidget(self.restitch_progress)
 
-        # Script area
+        script_label = QLabel("📄 Script")
+        script_label.setProperty("class", "h2")
+        mid_layout.addWidget(script_label)
+
         self.script_view = QTextBrowser()
-        self.script_view.setMaximumHeight(140)
         self.script_view.setStyleSheet(
             "QTextBrowser { background: #11111b; border: 1px solid #313244; border-radius: 6px; color: #cdd6f4; padding: 8px; }"
         )
         self.script_view.setPlaceholderText("Script will appear here...")
+        mid_layout.addWidget(self.script_view, stretch=1)
 
-        # Scene controls
-        scene_ctrl_row = QHBoxLayout()
-        self.history_tts_engine_combo = QComboBox()
-        self.history_tts_engine_combo.addItems(["Gemini (Puck Voice)", "Google Cloud (Journey-D)"])
-        self.history_tts_engine_combo.setToolTip("Select TTS engine for history scene audio generation.")
-        self.history_generate_all_btn = QPushButton("⚡ Auto-Generate All Scenes")
-        self.history_generate_all_btn.setProperty("class", "success-button")
-        self.history_generate_all_btn.clicked.connect(self._on_history_generate_all)
-        self.history_stop_btn = QPushButton("⏹️ Stop")
-        self.history_stop_btn.setProperty("class", "danger-button")
-        self.history_stop_btn.hide()
-        scene_ctrl_row.addWidget(QLabel("TTS Engine:"))
-        scene_ctrl_row.addWidget(self.history_tts_engine_combo)
-        scene_ctrl_row.addStretch()
-        scene_ctrl_row.addWidget(self.history_generate_all_btn)
-        scene_ctrl_row.addWidget(self.history_stop_btn)
-
-        # Scenes scroll
-        self.scenes_scroll = QScrollArea()
-        self.scenes_scroll.setWidgetResizable(True)
-        self.scenes_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        self.scenes_widget = QWidget()
-        self.scenes_layout = QVBoxLayout(self.scenes_widget)
-        self.scenes_layout.setSpacing(8)
-        self.scenes_layout.addStretch()
-        self.scenes_scroll.setWidget(self.scenes_widget)
-
-        # History audio player (in-app) — pinned to bottom
+        # Audio player pinned to bottom of middle column
         self.history_player_frame = QFrame()
         self.history_player_frame.setStyleSheet(
             "background:#1e1e2e; border:1px solid #313244; border-radius:8px;"
@@ -1101,26 +1615,63 @@ class HistoryTab(QWidget):
         player_btn_row.addWidget(self.history_player_stop_btn)
         player_btn_row.addStretch()
         hp_layout.addLayout(player_btn_row)
+        mid_layout.addWidget(self.history_player_frame)
+        mid_panel.setMinimumWidth(260)
 
-        # Add to right_layout in final logical order
-        right_layout.addWidget(self.detail_header)
-        right_layout.addLayout(vid_row)
-        right_layout.addWidget(self.restitch_status)
-        right_layout.addWidget(self.restitch_progress)
-        right_layout.addWidget(QLabel("📄 Generated Script:"))
-        right_layout.addWidget(self.script_view)
-        right_layout.addWidget(QLabel("🎬 Scenes & Assets:"))
+        # ── COL 3: Scenes & assets ─────────────────────────────────────────────
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        scenes_header = QLabel("🎬 Scenes & Assets")
+        scenes_header.setProperty("class", "h2")
+        right_layout.addWidget(scenes_header)
+
+        scene_ctrl_row = QHBoxLayout()
+        self.history_tts_engine_combo = QComboBox()
+        self.history_tts_engine_combo.addItems([
+            "Gemini — Puck (Male)",
+            "Gemini — Charon (Male)",
+            "Gemini — Fenrir (Male)",
+            "Gemini — Kore (Female)",
+            "Gemini — Aoede (Female)",
+            "Gemini — Leda (Female)",
+            "Google Cloud (Journey-D)",
+        ])
+        self.history_tts_engine_combo.setToolTip("Select TTS voice for history scene audio generation.")
+        self.history_generate_all_btn = QPushButton("⚡ Generate All")
+        self.history_generate_all_btn.setProperty("class", "success-button")
+        self.history_generate_all_btn.clicked.connect(self._on_history_generate_all)
+        self.history_stop_btn = QPushButton("⏹️ Stop")
+        self.history_stop_btn.setProperty("class", "danger-button")
+        self.history_stop_btn.hide()
+        scene_ctrl_row.addWidget(self.history_tts_engine_combo)
+        scene_ctrl_row.addStretch()
+        scene_ctrl_row.addWidget(self.history_generate_all_btn)
+        scene_ctrl_row.addWidget(self.history_stop_btn)
         right_layout.addLayout(scene_ctrl_row)
-        right_layout.addWidget(self.scenes_scroll)
-        right_layout.addWidget(self.history_player_frame)
+
+        self.scenes_scroll = QScrollArea()
+        self.scenes_scroll.setWidgetResizable(True)
+        self.scenes_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.scenes_widget = QWidget()
+        self.scenes_layout = QVBoxLayout(self.scenes_widget)
+        self.scenes_layout.setSpacing(8)
+        self.scenes_layout.addStretch()
+        self.scenes_scroll.setWidget(self.scenes_widget)
+        right_layout.addWidget(self.scenes_scroll, stretch=1)
+        right_panel.setMinimumWidth(320)
 
         splitter.addWidget(left_panel)
+        splitter.addWidget(mid_panel)
         splitter.addWidget(right_panel)
-        splitter.setSizes([260, 780])
+        splitter.setSizes([220, 360, 620])
         root_layout.addWidget(splitter)
         self.setLayout(root_layout)
 
         self._topic_rows = []
+        self._current_topic_id = None
         self._current_video_path = None
         self._current_scenes = []   # scene dicts built from DB for re-stitching
         self._current_topic = ""
@@ -1148,22 +1699,85 @@ class HistoryTab(QWidget):
     def load_history(self):
         self.topic_list.clear()
         self._topic_rows = db.get_all_topics()
+        self.delete_topic_btn.setEnabled(False)
         for row in self._topic_rows:
             tid, topic, duration, created_at = row
             item = QListWidgetItem(f"{topic}\n{duration} min  |  {created_at[:16]}")
             item.setSizeHint(QSize(0, 54))
             self.topic_list.addItem(item)
+        if not self._topic_rows:
+            self._clear_history_detail()
+
+    def _clear_history_detail(self):
+        self._current_topic_id = None
+        self._current_topic = ""
+        self._current_video_path = None
+        self._current_scenes = []
+        self._history_topic_folder = ""
+        self.detail_header.setText("Select a topic to view details.")
+        self.video_lbl.setText("No final video yet.")
+        self.video_lbl.setStyleSheet("color: #585b70;")
+        self.script_view.clear()
+        self.view_video_btn.hide()
+        self.open_folder_btn.hide()
+        self.play_video_btn.hide()
+        self.restitch_btn.hide()
+        self.restitch_status.hide()
+        self.restitch_progress.hide()
+        self.history_generate_all_btn.setEnabled(False)
+        self.delete_topic_btn.setEnabled(False)
+        self._audio_player.stop()
+        self._audio_player_scene_idx = None
+        self._reset_history_player_ui()
+        while self.scenes_layout.count() > 1:
+            item = self.scenes_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._history_scene_refs = []
+        self._history_scene_audio_controls = {}
+        self._history_scene_audio_paths = {}
+
+    def _delete_current_topic(self):
+        if not self._current_topic_id or not self._current_topic:
+            return
+
+        topic = self._current_topic
+        reply = QMessageBox.question(
+            self,
+            "Delete Topic",
+            f"Delete \"{topic}\" and all of its saved scenes, assets, and video?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        topic_folder = os.path.join(
+            os.path.dirname(__file__), 'assets', make_safe_topic(topic)
+        )
+        self._audio_player.stop()
+        self._audio_player_scene_idx = None
+        db.delete_topic(self._current_topic_id)
+        shutil.rmtree(topic_folder, ignore_errors=True)
+        self.load_history()
+        self._clear_history_detail()
 
     def _on_topic_selected(self, index):
         if index < 0 or index >= len(self._topic_rows):
+            self._clear_history_detail()
             return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
         tid = self._topic_rows[index][0]
         topic_row, scenes = db.get_topic_detail(tid)
         if not topic_row:
+            QApplication.restoreOverrideCursor()
             return
 
         _, topic, duration, script_text, created_at = topic_row
+        self._current_topic_id = tid
         self._current_topic = topic
+        self.delete_topic_btn.setEnabled(True)
         self.detail_header.setText(f"🎬 {topic}  ({duration} min)  ·  {created_at[:16]}")
         self.script_view.setPlainText(script_text or "")
 
@@ -1220,6 +1834,7 @@ class HistoryTab(QWidget):
         self.restitch_status.hide()
         self.restitch_progress.hide()
         self._render_history_scene_cards()
+        QApplication.restoreOverrideCursor()
 
     def _update_restitch_button_visibility(self):
         all_ready = all(
@@ -1239,7 +1854,7 @@ class HistoryTab(QWidget):
 
         for i, scene in enumerate(self._current_scenes):
             card = QFrame()
-            card.setStyleSheet("background-color: #2b2b36; border-radius: 6px; padding: 8px;")
+            card.setStyleSheet("QFrame { background-color: #2b2b36; border-radius: 6px; padding: 8px; }")
             card_layout = QHBoxLayout(card)
 
             text_block = QVBoxLayout()
@@ -1271,19 +1886,11 @@ class HistoryTab(QWidget):
             gen_aud_btn.setProperty("class", "primary-button")
             play_aud_btn = QPushButton("🔊 Play Audio")
             play_aud_btn.setProperty("class", "secondary-button")
-            pause_aud_btn = QPushButton("⏸️ Pause")
-            pause_aud_btn.setProperty("class", "secondary-button")
-            stop_aud_btn = QPushButton("⏹️ Stop")
-            stop_aud_btn.setProperty("class", "secondary-button")
             play_aud_btn.hide()
-            pause_aud_btn.hide()
-            stop_aud_btn.hide()
             aud_status = QLabel("")
             aud_status.setStyleSheet("color: #a6e3a1;")
             aud_row.addWidget(gen_aud_btn)
             aud_row.addWidget(play_aud_btn)
-            aud_row.addWidget(pause_aud_btn)
-            aud_row.addWidget(stop_aud_btn)
             aud_row.addWidget(aud_status)
             aud_row.addStretch()
             text_block.addLayout(aud_row)
@@ -1291,6 +1898,7 @@ class HistoryTab(QWidget):
             thumb = QLabel()
             thumb.setFixedSize(142, 80)
             thumb.setAlignment(Qt.AlignCenter)
+            thumb.hide()
             if scene.get('img_path') and os.path.exists(scene['img_path']):
                 pix = QPixmap(scene['img_path'])
                 thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
@@ -1307,31 +1915,13 @@ class HistoryTab(QWidget):
             if scene.get('audio_path') and os.path.exists(scene['audio_path']):
                 self._history_scene_audio_paths[i] = scene['audio_path']
                 play_aud_btn.show()
-                pause_aud_btn.show()
-                stop_aud_btn.show()
                 try:
                     play_aud_btn.clicked.disconnect()
                 except TypeError:
                     pass
-                try:
-                    pause_aud_btn.clicked.disconnect()
-                except TypeError:
-                    pass
-                try:
-                    stop_aud_btn.clicked.disconnect()
-                except TypeError:
-                    pass
                 play_aud_btn.clicked.connect(
-                    lambda _, p=scene['audio_path'], idx=i, lbl=aud_status, pb=pause_aud_btn:
-                    self._play_history_audio(p, idx, lbl, pb)
-                )
-                pause_aud_btn.clicked.connect(
-                    lambda _, idx=i, lbl=aud_status, pb=pause_aud_btn:
-                    self._pause_resume_history_audio(idx, lbl, pb)
-                )
-                stop_aud_btn.clicked.connect(
-                    lambda _, idx=i, lbl=aud_status, pb=pause_aud_btn:
-                    self._stop_history_audio(idx, lbl, pb)
+                    lambda _, p=scene['audio_path'], idx=i, lbl=aud_status:
+                    self._play_history_audio(p, idx, lbl, None)
                 )
 
             def create_img_handler(idx=i, s=scene, status_lbl=img_status, btn=gen_img_btn, preview_lbl=thumb, view_btn=view_img_btn):
@@ -1339,7 +1929,12 @@ class HistoryTab(QWidget):
                 btn.setEnabled(False)
                 status_lbl.setText("⏳ Generating Image...")
                 status_lbl.setStyleSheet("color: #f9e2af;")
-                thread = ImageGenerationThread(s.get('visual', ''), out_path)
+                thread = ImageGenerationThread(
+                    s.get('visual', ''),
+                    out_path,
+                    make_scene_overlay_text(s.get('narration', ''), s.get('visual', '')),
+                    s.get('narration', ''),
+                )
                 setattr(self, f"history_img_thread_{idx}", thread)
 
                 def on_finish(success, path):
@@ -1366,16 +1961,15 @@ class HistoryTab(QWidget):
                 thread.start()
 
             def create_aud_handler(
-                idx=i, s=scene, status_lbl=aud_status, btn=gen_aud_btn,
-                play_btn=play_aud_btn, pause_btn=pause_aud_btn, stop_btn=stop_aud_btn
+                idx=i, s=scene, status_lbl=aud_status, btn=gen_aud_btn, play_btn=play_aud_btn
             ):
-                engine = "gemini" if "Gemini" in self.history_tts_engine_combo.currentText() else "google"
+                engine, voice = parse_tts_selection(self.history_tts_engine_combo.currentText())
                 audio_ext = "wav" if engine == "gemini" else "mp3"
                 out_path = os.path.join(self._history_topic_folder, f"scene_{idx+1}.{audio_ext}")
                 btn.setEnabled(False)
                 status_lbl.setText("⏳ Generating Audio...")
                 status_lbl.setStyleSheet("color: #f9e2af;")
-                thread = AudioGenerationThread(s.get('narration', ''), out_path, engine)
+                thread = AudioGenerationThread(s.get('narration', ''), out_path, engine, voice)
                 setattr(self, f"history_aud_thread_{idx}", thread)
 
                 def on_finish(success, path):
@@ -1387,31 +1981,13 @@ class HistoryTab(QWidget):
                         self._history_scene_audio_paths[idx] = path
                         db.update_scene_asset(s.get('db_id'), 'audio_path', path)
                         play_btn.show()
-                        pause_btn.show()
-                        stop_btn.show()
                         try:
                             play_btn.clicked.disconnect()
                         except TypeError:
                             pass
-                        try:
-                            pause_btn.clicked.disconnect()
-                        except TypeError:
-                            pass
-                        try:
-                            stop_btn.clicked.disconnect()
-                        except TypeError:
-                            pass
                         play_btn.clicked.connect(
-                            lambda _, p=path, scene_idx=idx, lbl=status_lbl, pb=pause_btn:
-                            self._play_history_audio(p, scene_idx, lbl, pb)
-                        )
-                        pause_btn.clicked.connect(
-                            lambda _, scene_idx=idx, lbl=status_lbl, pb=pause_btn:
-                            self._pause_resume_history_audio(scene_idx, lbl, pb)
-                        )
-                        stop_btn.clicked.connect(
-                            lambda _, scene_idx=idx, lbl=status_lbl, pb=pause_btn:
-                            self._stop_history_audio(scene_idx, lbl, pb)
+                            lambda _, p=path, scene_idx=idx, lbl=status_lbl:
+                            self._play_history_audio(p, scene_idx, lbl, None)
                         )
                     else:
                         status_lbl.setText("❌ Audio Failed.")
@@ -1427,12 +2003,38 @@ class HistoryTab(QWidget):
             card_layout.addLayout(text_block, stretch=3)
             card_layout.addWidget(thumb)
             self.scenes_layout.insertWidget(self.scenes_layout.count() - 1, card)
-            self._history_scene_refs.append((scene, img_status, aud_status, thumb, view_img_btn, play_aud_btn, pause_aud_btn, stop_aud_btn))
-            self._history_scene_audio_controls[i] = (aud_status, pause_aud_btn)
+            self._history_scene_refs.append((scene, img_status, aud_status, thumb, view_img_btn, play_aud_btn))
+            self._history_scene_audio_controls[i] = aud_status
 
     def _on_history_generate_all(self):
         if not self._current_scenes:
             return
+
+        has_existing_assets = any(
+            (scene.get('img_path') and os.path.exists(scene['img_path']))
+            or (scene.get('audio_path') and os.path.exists(scene['audio_path']))
+            for scene in self._current_scenes
+        )
+        skip_existing = False
+
+        if has_existing_assets:
+            # Ask the user whether to regenerate everything or only missing assets
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Generate Assets")
+            msg_box.setText("What would you like to generate?")
+            msg_box.setInformativeText(
+                "• <b>Missing only</b> — skip scenes that already have an image and audio file.<br>"
+                "• <b>Regenerate all</b> — overwrite every image and audio, even if they exist."
+            )
+            btn_missing = msg_box.addButton("Missing only", QMessageBox.AcceptRole)
+            btn_all     = msg_box.addButton("Regenerate all", QMessageBox.DestructiveRole)
+            msg_box.addButton(QMessageBox.Cancel)
+            msg_box.exec_()
+
+            clicked = msg_box.clickedButton()
+            if clicked is None or clicked == msg_box.button(QMessageBox.Cancel):
+                return
+            skip_existing = (clicked == btn_missing)
 
         self.history_generate_all_btn.setEnabled(False)
         self.history_generate_all_btn.setText("⏳ Generating...")
@@ -1440,10 +2042,12 @@ class HistoryTab(QWidget):
         self.history_stop_btn.setEnabled(True)
         self.history_stop_btn.setText("⏹️ Stop")
 
-        engine = "gemini" if "Gemini" in self.history_tts_engine_combo.currentText() else "google"
+        engine, voice = parse_tts_selection(self.history_tts_engine_combo.currentText())
         status_map = {idx: refs for idx, refs in enumerate(self._history_scene_refs)}
 
-        self._history_bulk_thread = BulkGenerationThread(self._current_scenes, self._history_topic_folder, engine)
+        self._history_bulk_thread = BulkGenerationThread(
+            self._current_scenes, self._history_topic_folder, engine, voice, skip_existing
+        )
 
         try:
             self.history_stop_btn.clicked.disconnect()
@@ -1460,54 +2064,48 @@ class HistoryTab(QWidget):
         def on_scene_progress(idx, asset_type, msg):
             if idx not in status_map:
                 return
-            scene, lbl_img, lbl_aud, thumb, view_btn, play_btn, pause_btn, stop_btn = status_map[idx]
+            total_steps = max(1, len(self._current_scenes) * 2)
+            step_idx = idx * 2 + (1 if asset_type == 'aud' else 0)
             msg_l = (msg or "").lower()
+            if "done" in msg_l or "skipped" in msg_l:
+                completed_steps = step_idx + 1
+            else:
+                completed_steps = step_idx
+            pct = min(100, max(0, int(round(completed_steps / total_steps * 100))))
+            self.history_generate_all_btn.setText(f"⏳ Generating... {pct}%")
+            scene, lbl_img, lbl_aud, thumb, view_btn, play_btn = status_map[idx]
             is_done = "done" in msg_l
             is_in_progress = "generating" in msg_l
-            if asset_type == 'img':
-                lbl_img.setText(msg)
-                lbl_img.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
-                if is_done and scene.get('img_path') and os.path.exists(scene['img_path']):
-                    pix = QPixmap(scene['img_path'])
-                    thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
-                    view_btn.show()
-                    try:
-                        view_btn.clicked.disconnect()
-                    except TypeError:
-                        pass
-                    view_btn.clicked.connect(lambda _, p=scene['img_path']: self._show_history_image_preview(p))
-            else:
-                lbl_aud.setText(msg)
-                lbl_aud.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
-                if is_done and scene.get('audio_path') and os.path.exists(scene['audio_path']):
-                    self._history_scene_audio_paths[idx] = scene['audio_path']
-                    play_btn.show()
-                    pause_btn.show()
-                    stop_btn.show()
-                    try:
-                        play_btn.clicked.disconnect()
-                    except TypeError:
-                        pass
-                    try:
-                        pause_btn.clicked.disconnect()
-                    except TypeError:
-                        pass
-                    try:
-                        stop_btn.clicked.disconnect()
-                    except TypeError:
-                        pass
-                    play_btn.clicked.connect(
-                        lambda _, p=scene['audio_path'], scene_idx=idx, lbl=lbl_aud, pb=pause_btn:
-                        self._play_history_audio(p, scene_idx, lbl, pb)
-                    )
-                    pause_btn.clicked.connect(
-                        lambda _, scene_idx=idx, lbl=lbl_aud, pb=pause_btn:
-                        self._pause_resume_history_audio(scene_idx, lbl, pb)
-                    )
-                    stop_btn.clicked.connect(
-                        lambda _, scene_idx=idx, lbl=lbl_aud, pb=pause_btn:
-                        self._stop_history_audio(scene_idx, lbl, pb)
-                    )
+            try:
+                if asset_type == 'img':
+                    lbl_img.setText(msg)
+                    lbl_img.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                    if is_done and scene.get('img_path') and os.path.exists(scene['img_path']):
+                        pix = QPixmap(scene['img_path'])
+                        thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                        view_btn.show()
+                        try:
+                            view_btn.clicked.disconnect()
+                        except TypeError:
+                            pass
+                        view_btn.clicked.connect(lambda _, p=scene['img_path']: self._show_history_image_preview(p))
+                else:
+                    lbl_aud.setText(msg)
+                    lbl_aud.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                    if is_done and scene.get('audio_path') and os.path.exists(scene['audio_path']):
+                        self._history_scene_audio_paths[idx] = scene['audio_path']
+                        play_btn.show()
+                        try:
+                            play_btn.clicked.disconnect()
+                        except TypeError:
+                            pass
+                        play_btn.clicked.connect(
+                            lambda _, p=scene['audio_path'], scene_idx=idx, lbl=lbl_aud:
+                            self._play_history_audio(p, scene_idx, lbl, None)
+                        )
+            except RuntimeError:
+                # Widget was deleted (user navigated away) before the thread finished — ignore.
+                pass
 
         def on_all_done(all_ok, msg):
             self.history_generate_all_btn.setEnabled(True)
@@ -1577,39 +2175,35 @@ class HistoryTab(QWidget):
             if not self._history_scene_audio_paths:
                 return
             first_idx = sorted(self._history_scene_audio_paths.keys())[0]
-            ctrl = self._history_scene_audio_controls.get(first_idx)
-            if ctrl:
-                lbl, pause_btn = ctrl
-                self._play_history_audio(self._history_scene_audio_paths[first_idx], first_idx, lbl, pause_btn)
+            lbl = self._history_scene_audio_controls.get(first_idx)
+            if lbl:
+                self._play_history_audio(self._history_scene_audio_paths[first_idx], first_idx, lbl, None)
             return
 
         if self._audio_player.state() == QMediaPlayer.PausedState:
             self._audio_player.play()
             return
 
-        ctrl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
+        lbl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
         path = self._history_scene_audio_paths.get(self._audio_player_scene_idx, "")
-        if ctrl and path:
-            lbl, pause_btn = ctrl
-            self._play_history_audio(path, self._audio_player_scene_idx, lbl, pause_btn)
+        if lbl and path:
+            self._play_history_audio(path, self._audio_player_scene_idx, lbl, None)
 
     def _on_history_player_pause_clicked(self):
         if self._audio_player_scene_idx is None:
             return
-        ctrl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
-        if not ctrl:
+        lbl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
+        if not lbl:
             return
-        lbl, pause_btn = ctrl
-        self._pause_resume_history_audio(self._audio_player_scene_idx, lbl, pause_btn)
+        self._pause_resume_history_audio(self._audio_player_scene_idx, lbl)
 
     def _on_history_player_stop_clicked(self):
         if self._audio_player_scene_idx is None:
             return
-        ctrl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
-        if not ctrl:
+        lbl = self._history_scene_audio_controls.get(self._audio_player_scene_idx)
+        if not lbl:
             return
-        lbl, pause_btn = ctrl
-        self._stop_history_audio(self._audio_player_scene_idx, lbl, pause_btn)
+        self._stop_history_audio(self._audio_player_scene_idx, lbl)
 
     def _show_history_image_preview(self, path: str):
         if not path or not os.path.exists(path):
@@ -1637,9 +2231,8 @@ class HistoryTab(QWidget):
         self.history_now_playing_lbl.setText(f"Now Playing: Scene {scene_idx + 1}")
         status_label.setText("Playing")
         status_label.setStyleSheet("color: #a6e3a1;")
-        pause_btn.setText("Pause")
 
-    def _pause_resume_history_audio(self, scene_idx: int, status_label: QLabel, pause_btn: QPushButton):
+    def _pause_resume_history_audio(self, scene_idx: int, status_label: QLabel):
         if self._audio_player_scene_idx != scene_idx:
             status_label.setText("Play this scene first")
             status_label.setStyleSheet("color: #f9e2af;")
@@ -1649,14 +2242,12 @@ class HistoryTab(QWidget):
             self._audio_player.pause()
             status_label.setText("Paused")
             status_label.setStyleSheet("color: #f9e2af;")
-            pause_btn.setText("Resume")
         elif state == QMediaPlayer.PausedState:
             self._audio_player.play()
             status_label.setText("Playing")
             status_label.setStyleSheet("color: #a6e3a1;")
-            pause_btn.setText("Pause")
 
-    def _stop_history_audio(self, scene_idx: int, status_label: QLabel, pause_btn: QPushButton):
+    def _stop_history_audio(self, scene_idx: int, status_label: QLabel):
         if self._audio_player_scene_idx != scene_idx:
             status_label.setText("Stopped")
             status_label.setStyleSheet("color: #cdd6f4;")
@@ -1666,7 +2257,6 @@ class HistoryTab(QWidget):
         self._reset_history_player_ui()
         status_label.setText("Stopped")
         status_label.setStyleSheet("color: #cdd6f4;")
-        pause_btn.setText("Pause")
 
     def _on_restitch_clicked(self):
         if not self._current_scenes:
@@ -1725,20 +2315,9 @@ class AppWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Infographic Video Generator")
-        self.resize(1050, 750)
+        self.resize(1530, 825)
         
-        # Enable native windows dark title bar
-        try:
-            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-            set_window_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
-            get_parent = ctypes.windll.user32.GetParent
-            hwnd = get_parent(self.winId())
-            if not hwnd:
-                hwnd = self.winId()
-            value = ctypes.c_int(2)
-            set_window_attribute(int(hwnd), DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value))
-        except Exception:
-            pass
+        QTimer.singleShot(0, self._apply_dark_title_bar)
         
         # Main Layout
         self.tabs = QTabWidget()
@@ -1754,6 +2333,7 @@ class AppWindow(QMainWindow):
         self.tabs.addTab(self.history_tab, "📚 History")
         
         self.setCentralWidget(self.tabs)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         
         self.current_scenes = []
         self.current_topic = ""
@@ -1779,12 +2359,57 @@ class AppWindow(QMainWindow):
             self._tray.setToolTip("Infographic Video Generator")
             self._tray.show()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_dark_title_bar()
+
+    def _apply_dark_title_bar(self):
+        """Request a dark native title bar on supported Windows builds."""
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+
+            set_window_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+            dark_mode = ctypes.c_int(1)
+            for attr in (20, 19):
+                try:
+                    set_window_attribute(
+                        hwnd,
+                        attr,
+                        ctypes.byref(dark_mode),
+                        ctypes.sizeof(dark_mode),
+                    )
+                except Exception:
+                    pass
+
+            caption_color = ctypes.c_int(0x00202020)
+            text_color = ctypes.c_int(0x00F2F2F2)
+            for attr, value in ((35, caption_color), (36, text_color)):
+                try:
+                    set_window_attribute(
+                        hwnd,
+                        attr,
+                        ctypes.byref(value),
+                        ctypes.sizeof(value),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def on_script_next(self, scenes):
         self.current_scenes = scenes
         self.storyboard_tab.load_scenes(self.current_scenes, topic=self.current_topic)
         self.tabs.setCurrentIndex(1)
         self.export_tab.reset_ui()
         self.export_tab.populate_thumbnails(self.current_scenes)
+
+    def _on_tab_changed(self, index: int):
+        if self.tabs.widget(index) is self.export_tab and self.current_scenes:
+            self.export_tab.populate_thumbnails(self.current_scenes)
         
     def start_stitching_process(self):
         # Strict upfront completeness check — collect every missing asset
@@ -1942,11 +2567,18 @@ QPushButton {
 }
 
 QPushButton:hover {
-    background-color: #45475a;
+    background-color: #4c4f69;
+    color: #ffffff;
 }
 
 QPushButton:pressed {
-    background-color: #585b70;
+    background-color: #6c6f85;
+    color: #ffffff;
+}
+
+QPushButton:disabled {
+    background-color: #232436;
+    color: #585b70;
 }
 
 /* Specific Button Classes setup via setProperty */
@@ -1957,15 +2589,31 @@ QPushButton[class="primary-button"] {
 }
 QPushButton[class="primary-button"]:hover {
     background-color: #3b82f6;
+    color: #ffffff;
+}
+QPushButton[class="primary-button"]:pressed {
+    background-color: #1d4ed8;
+}
+QPushButton[class="primary-button"]:disabled {
+    background-color: #1e3a6e;
+    color: #6b8cc7;
 }
 
 QPushButton[class="secondary-button"] {
     background-color: #45475a;
-    color: #ffffff;
+    color: #cdd6f4;
     font-weight: bold;
 }
 QPushButton[class="secondary-button"]:hover {
-    background-color: #585b70;
+    background-color: #5c5f77;
+    color: #ffffff;
+}
+QPushButton[class="secondary-button"]:pressed {
+    background-color: #6c6f85;
+}
+QPushButton[class="secondary-button"]:disabled {
+    background-color: #2c2d3a;
+    color: #585b70;
 }
 
 QPushButton[class="success-button"] {
@@ -1975,6 +2623,31 @@ QPushButton[class="success-button"] {
 }
 QPushButton[class="success-button"]:hover {
     background-color: #22c55e;
+    color: #ffffff;
+}
+QPushButton[class="success-button"]:pressed {
+    background-color: #15803d;
+}
+QPushButton[class="success-button"]:disabled {
+    background-color: #14532d;
+    color: #4ade80;
+}
+
+QPushButton[class="danger-button"] {
+    background-color: #dc2626;
+    color: #ffffff;
+    font-weight: bold;
+}
+QPushButton[class="danger-button"]:hover {
+    background-color: #ef4444;
+    color: #ffffff;
+}
+QPushButton[class="danger-button"]:pressed {
+    background-color: #b91c1c;
+}
+QPushButton[class="danger-button"]:disabled {
+    background-color: #7f1d1d;
+    color: #fca5a5;
 }
 """
 
