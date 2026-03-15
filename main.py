@@ -214,7 +214,12 @@ class BulkGenerationThread(QThread):
         self.is_cancelled = True
 
     def run(self):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        try:
+            self._run_inner()
+        except BaseException as e:
+            self.all_done.emit(False, f"Generation error: {type(e).__name__}: {e}")
+
+    def _run_inner(self):
         os.makedirs(self.topic_folder, exist_ok=True)
 
         total = len(self.scenes)
@@ -248,10 +253,34 @@ class BulkGenerationThread(QThread):
             skip_img = self.skip_existing and img_exists
             skip_aud = self.skip_existing and aud_exists
 
-            # --- Emit immediate skips ---
+            # --- Image ---
             if skip_img:
                 scene['img_path'] = img_path if os.path.exists(img_path) else existing_img
                 self.scene_progress.emit(i, 'img', '⏭️ Image skipped (exists)')
+            else:
+                self.scene_progress.emit(i, 'img', f'⏳ Generating image {img_done+1}/{total}...')
+                try:
+                    img_ok = generate_image_from_prompt(
+                        scene.get('visual', ''),
+                        img_path,
+                        make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', '')),
+                        scene.get('narration', ''),
+                    )
+                except BaseException as e:
+                    img_ok = False
+                if img_ok:
+                    img_done += 1
+                    scene['img_path'] = img_path
+                    try:
+                        db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
+                    except Exception:
+                        pass
+                    self.scene_progress.emit(i, 'img', f'✅ Image done ({img_done}/{total})')
+                else:
+                    failed.append(f"Scene {idx} Image")
+                    self.scene_progress.emit(i, 'img', '❌ Image failed')
+
+            # --- Audio ---
             if skip_aud:
                 if os.path.exists(aud_path):
                     scene['audio_path'] = aud_path
@@ -260,67 +289,24 @@ class BulkGenerationThread(QThread):
                 else:
                     scene['audio_path'] = existing_aud
                 self.scene_progress.emit(i, 'aud', '⏭️ Audio skipped (exists)')
-
-            if skip_img and skip_aud:
-                continue
-
-            # --- Run image + audio in parallel ---
-            def _gen_img(_scene=scene, _img_path=img_path, _i=i, _total=total, _img_n=img_done+1):
-                self.scene_progress.emit(_i, 'img', f'⏳ Generating image {_img_n}/{_total}...')
+            else:
+                self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {aud_done+1}/{total}...')
                 try:
-                    return generate_image_from_prompt(
-                        _scene.get('visual', ''),
-                        _img_path,
-                        make_scene_overlay_text(_scene.get('narration', ''), _scene.get('visual', '')),
-                        _scene.get('narration', ''),
-                    ), None
-                except Exception as e:
-                    return False, str(e)
-
-            def _gen_aud(_scene=scene, _aud_path=aud_path, _i=i, _total=total, _aud_n=aud_done+1):
-                self.scene_progress.emit(_i, 'aud', f'⏳ Generating audio {_aud_n}/{_total}...')
-                try:
-                    return generate_audio_from_text(_scene.get('narration', ''), _aud_path, self.tts_engine, self.tts_voice), None
-                except Exception as e:
-                    return False, str(e)
-
-            futures = {}
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                if not skip_img:
-                    futures['img'] = ex.submit(_gen_img)
-                if not skip_aud:
-                    futures['aud'] = ex.submit(_gen_aud)
-
-            if 'img' in futures:
-                try:
-                    img_ok, img_err = futures['img'].result()
-                except Exception as e:
-                    img_ok, img_err = False, str(e)
-                if img_ok:
-                    img_done += 1
-                    scene['img_path'] = img_path
-                    db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
-                    self.scene_progress.emit(i, 'img', f'✅ Image done ({img_done}/{total})')
-                else:
-                    err_detail = f": {img_err}" if img_err else ""
-                    failed.append(f"Scene {idx} Image{err_detail}")
-                    self.scene_progress.emit(i, 'img', f'❌ Image failed{err_detail}')
-
-            if 'aud' in futures:
-                try:
-                    aud_ok, aud_err = futures['aud'].result()
-                except Exception as e:
-                    aud_ok, aud_err = False, str(e)
+                    aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path, self.tts_engine, self.tts_voice)
+                except BaseException as e:
+                    aud_ok = False
                 if aud_ok:
                     aud_done += 1
                     scene['audio_path'] = aud_path
-                    db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
-                    db.update_scene_asset(scene.get('db_id'), 'tts_voice', self.tts_voice or '')
+                    try:
+                        db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
+                        db.update_scene_asset(scene.get('db_id'), 'tts_voice', self.tts_voice or '')
+                    except Exception:
+                        pass
                     self.scene_progress.emit(i, 'aud', f'✅ Audio done ({aud_done}/{total})')
                 else:
-                    err_detail = f": {aud_err}" if aud_err else ""
-                    failed.append(f"Scene {idx} Audio{err_detail}")
-                    self.scene_progress.emit(i, 'aud', f'❌ Audio failed{err_detail}')
+                    failed.append(f"Scene {idx} Audio")
+                    self.scene_progress.emit(i, 'aud', '❌ Audio failed')
 
         if failed:
             self.all_done.emit(False, f"Completed with failures: {', '.join(failed)}")
@@ -1922,7 +1908,7 @@ class HistoryTab(QWidget):
         self._current_topic_id = tid
         self._current_topic = topic
         self.delete_topic_btn.setEnabled(True)
-        self.detail_header.setText(f"🎬 {topic}  ({duration} min)  ·  {created_at[:16]}")
+        self.detail_header.setText(f"🎬 {topic.title()}  ({duration} min)  ·  {created_at[:16]}")
         self.script_view.setPlainText(script_text or "")
 
         # Build scene dicts usable by VideoStitchingThread
@@ -2248,10 +2234,6 @@ class HistoryTab(QWidget):
                 if asset_type == 'img':
                     lbl_img.setText(msg)
                     lbl_img.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
-                    if is_in_progress:
-                        self._start_spin(lbl_img, msg)
-                    else:
-                        self._stop_spin(lbl_img)
                     if is_done and scene.get('img_path') and os.path.exists(scene['img_path']):
                         pix = QPixmap(scene['img_path'])
                         thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
@@ -2264,10 +2246,6 @@ class HistoryTab(QWidget):
                 else:
                     lbl_aud.setText(msg)
                     lbl_aud.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
-                    if is_in_progress:
-                        self._start_spin(lbl_aud, msg)
-                    else:
-                        self._stop_spin(lbl_aud)
                     if is_done and scene.get('audio_path') and os.path.exists(scene['audio_path']):
                         self._history_scene_audio_paths[idx] = scene['audio_path']
                         play_btn.show()
@@ -2625,7 +2603,56 @@ class SettingsTab(QWidget):
         api_layout.addLayout(save_row)
 
         layout.addWidget(api_frame)
+
+        # Image Resolution
+        res_frame = QFrame()
+        res_frame.setProperty("class", "card")
+        res_layout = QVBoxLayout(res_frame)
+        res_layout.setSpacing(10)
+
+        res_title = QLabel("Image Resolution")
+        res_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        res_layout.addWidget(res_title)
+
+        res_desc = QLabel("Higher resolution produces better quality images but takes longer to generate.")
+        res_desc.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        res_desc.setWordWrap(True)
+        res_layout.addWidget(res_desc)
+
+        res_row = QHBoxLayout()
+        res_lbl = QLabel("Resolution:")
+        self.res_combo = QComboBox()
+        self.res_combo.addItems(["512 (fastest)", "1K (default)", "2K", "4K (best quality)"])
+        saved_res = os.getenv("IMAGE_RESOLUTION", "1K")
+        res_map = {"512": 0, "1K": 1, "2K": 2, "4K": 3}
+        self.res_combo.setCurrentIndex(res_map.get(saved_res, 1))
+        res_row.addWidget(res_lbl)
+        res_row.addWidget(self.res_combo)
+        res_row.addStretch()
+        res_layout.addLayout(res_row)
+
+        save_res_row = QHBoxLayout()
+        save_res_btn = QPushButton("💾 Save Resolution")
+        save_res_btn.setProperty("class", "success-button")
+        save_res_btn.setFixedWidth(170)
+        self.res_status_lbl = QLabel("")
+        save_res_btn.clicked.connect(self._save_resolution)
+        save_res_row.addWidget(save_res_btn)
+        save_res_row.addWidget(self.res_status_lbl)
+        save_res_row.addStretch()
+        res_layout.addLayout(save_res_row)
+
+        layout.addWidget(res_frame)
         layout.addStretch()
+
+    def _save_resolution(self):
+        idx = self.res_combo.currentIndex()
+        val = ["512", "1K", "2K", "4K"][idx]
+        _save_env_key("IMAGE_RESOLUTION", val)
+        _load_env()
+        self.res_status_lbl.setText("✅ Saved.")
+        self.res_status_lbl.setStyleSheet("color: #a6e3a1;")
+        QTimer.singleShot(3000, lambda: self.res_status_lbl.setText(""))
 
     def _toggle_visibility(self, checked: bool):
         self.key_input.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)

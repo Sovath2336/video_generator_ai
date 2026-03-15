@@ -336,25 +336,30 @@ def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str 
         
     try:
         client = genai.Client(api_key=api_key)
-        # Using nano-banana model via standard generate_content
         result = client.models.generate_content(
-            model='nano-banana-pro-preview',
+            model='gemini-3.1-flash-image-preview',
             contents=_build_image_prompt(prompt, overlay_text, narration),
+            config=genai_types.GenerateContentConfig(
+                response_modalities=['TEXT', 'IMAGE'],
+                image_config=genai_types.ImageConfig(
+                    aspect_ratio='16:9',
+                    image_size=os.getenv("IMAGE_RESOLUTION", "1K"),
+                ),
+            ),
         )
-        
-        # The nano-banana model returns images inline
+        # Returns images inline in parts[].inline_data (TEXT+IMAGE modalities may both appear)
         if result.candidates and result.candidates[0].content.parts:
-            part = result.candidates[0].content.parts[0]
-            if hasattr(part, 'inline_data') and part.inline_data:
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                with open(output_path, "wb") as f:
-                    f.write(part.inline_data.data)
-                if _is_cta_image_prompt(prompt):
-                    try:
-                        shutil.copy2(output_path, _shared_cta_image_path())
-                    except Exception:
-                        pass
-                return True
+            for part in result.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    with open(output_path, "wb") as f:
+                        f.write(part.inline_data.data)
+                    if _is_cta_image_prompt(prompt):
+                        try:
+                            shutil.copy2(output_path, _shared_cta_image_path())
+                        except Exception:
+                            pass
+                    return True
             
     except Exception as e:
         print(f"Image Gen Error: {e}")
