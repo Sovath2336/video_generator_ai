@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import wave
@@ -12,20 +13,34 @@ import imageio_ffmpeg
 import requests
 from google import genai
 from google.genai import types as genai_types
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.cloud import texttospeech
-from google.oauth2 import service_account
 from dotenv import load_dotenv
 
-# Ensure ffmpeg is discoverable before importing pydub (prevents runtime warning).
+# Resolve writable app-data directory (same logic as main.py)
+def _ai_app_data_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        base = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')),
+                            'InfographicVideoGenerator')
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+# Load .env from the writable user-data location
+_env_path = os.path.join(_ai_app_data_dir(), '.env')
+load_dotenv(_env_path, override=True)
+
+# Resolve ffmpeg — in a frozen EXE use a writable temp alias dir
 _ffmpeg_exe = None
 try:
     _ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     _ffmpeg_dir = os.path.dirname(_ffmpeg_exe)
     if _ffmpeg_dir and _ffmpeg_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-    # pydub expects a binary named ffmpeg(.exe). Create a local alias if needed.
-    _alias_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ffmpeg_bin")
+    # pydub needs a binary literally named ffmpeg(.exe).
+    if getattr(sys, 'frozen', False):
+        _alias_dir = os.path.join(tempfile.gettempdir(), "InfographicVideoGen_ffmpeg")
+    else:
+        _alias_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ffmpeg_bin")
     os.makedirs(_alias_dir, exist_ok=True)
     _alias_exe = os.path.join(_alias_dir, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
     if not os.path.exists(_alias_exe):
@@ -37,9 +52,6 @@ except Exception:
     _ffmpeg_exe = None
 
 from pydub import AudioSegment
-
-# Load environment variables (API keys) from .env file
-load_dotenv()
 
 # Ensure pydub can discover ffmpeg without requiring system PATH setup.
 try:
@@ -380,139 +392,6 @@ def _parse_google_time_offset(value) -> float:
         return 0.0
 
 
-def _fetch_google_access_token() -> str:
-    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if not cred_path:
-        raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS is not set.")
-    if not os.path.isabs(cred_path):
-        cred_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cred_path)
-
-    creds = service_account.Credentials.from_service_account_file(
-        cred_path,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-    creds.refresh(GoogleAuthRequest())
-    if not creds.token:
-        raise RuntimeError("Unable to fetch Google Cloud access token.")
-    return creds.token
-
-
-def _recognize_word_offsets(script_text: str, audio_path: str):
-    """
-    Transcribe scene audio with Google Speech-to-Text and return word offsets.
-    Uses the script text as phrase context so the recognizer stays close to the narration.
-    """
-    script_words = _subtitle_word_items(script_text)
-    if not script_words:
-        return [], _audio_duration_seconds(audio_path)
-
-    token = _fetch_google_access_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-    temp_wav = None
-    def _speech_config():
-        phrases = [script_text] + [item["text"] for item in script_words[:500]]
-        return {
-            "encoding": "LINEAR16",
-            "sampleRateHertz": 16000,
-            "languageCode": "en-US",
-            "enableWordTimeOffsets": True,
-            "enableAutomaticPunctuation": False,
-            "model": "video",
-            "speechContexts": [{"phrases": phrases, "boost": 20.0}],
-        }
-
-    try:
-        audio = AudioSegment.from_file(audio_path).set_channels(1).set_frame_rate(16000).set_sample_width(2)
-        duration_sec = max(0.0, len(audio) / 1000.0)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf:
-            temp_wav = tf.name
-        audio.export(temp_wav, format="wav")
-        with open(temp_wav, "rb") as fh:
-            audio_b64 = base64.b64encode(fh.read()).decode("ascii")
-
-        def _extract_words(data: dict):
-            recognized = []
-            for result in data.get("results", []):
-                alternatives = result.get("alternatives", [])
-                if not alternatives:
-                    continue
-                for word in alternatives[0].get("words", []):
-                    text = str(word.get("word", "")).strip()
-                    spoken = text.replace("’", "'").lower()
-                    if not spoken:
-                        continue
-                    recognized.append(
-                        {
-                            "text": text,
-                            "spoken": spoken,
-                            "start_sec": _parse_google_time_offset(word.get("startTime")),
-                            "end_sec": _parse_google_time_offset(word.get("endTime")),
-                        }
-                    )
-            return recognized
-
-        recognized = []
-        if duration_sec <= 55.0:
-            payload = {
-                "config": _speech_config(),
-                "audio": {"content": audio_b64},
-            }
-            response = requests.post(
-                "https://speech.googleapis.com/v1/speech:recognize",
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-            response.raise_for_status()
-            recognized = _extract_words(response.json())
-
-        if not recognized:
-            payload = {
-                "config": _speech_config(),
-                "audio": {"content": audio_b64},
-            }
-            response = requests.post(
-                "https://speech.googleapis.com/v1/speech:longrunningrecognize",
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-            response.raise_for_status()
-            operation = response.json()
-            op_name = operation.get("name", "")
-            if not op_name:
-                raise RuntimeError("Speech-to-Text did not return an operation id.")
-
-            deadline = time.time() + 180
-            while time.time() < deadline:
-                poll = requests.get(
-                    f"https://speech.googleapis.com/v1/operations/{op_name}",
-                    headers=headers,
-                    timeout=60,
-                )
-                poll.raise_for_status()
-                op_data = poll.json()
-                if op_data.get("done"):
-                    if "error" in op_data:
-                        raise RuntimeError(op_data["error"].get("message", "Speech-to-Text alignment failed."))
-                    recognized = _extract_words(op_data.get("response", {}))
-                    break
-                time.sleep(2)
-
-        if not recognized:
-            raise RuntimeError("Speech-to-Text returned no word timings for this audio.")
-
-        return recognized, duration_sec
-    finally:
-        if temp_wav and os.path.exists(temp_wav):
-            try:
-                os.remove(temp_wav)
-            except OSError:
-                pass
 
 
 def _estimate_word_timings(script_text: str, audio_path: str):
@@ -659,11 +538,7 @@ def ensure_word_timing_data(script_text: str, audio_path: str, force: bool = Fal
         except Exception:
             pass
 
-    try:
-        recognized_words, duration_sec = _recognize_word_offsets(script_text, audio_path)
-        aligned_words = _align_script_words_to_offsets(script_text, recognized_words, duration_sec)
-    except Exception:
-        aligned_words = None
+    aligned_words = None
 
     if aligned_words is None:
         aligned_words = _estimate_word_timings(script_text, audio_path)
@@ -716,39 +591,6 @@ def _save_gemini_audio_bytes(audio_bytes: bytes, mime_type: str, output_path: st
         out.write(audio_bytes)
     return True
 
-def _generate_audio_with_google_tts(text: str, output_path: str) -> bool:
-    """
-    Uses Google Cloud TTS and saves MP3 audio to output_path.
-    """
-    # Client will automatically look for GOOGLE_APPLICATION_CREDENTIALS env var
-    client = texttospeech.TextToSpeechClient()
-
-    # Convert plain text to SSML to add natural pauses between sentences.
-    ssml_text = re.sub(r'([.?!])\s+', r'\1 <break time="500ms"/> ', text)
-    ssml = f"<speak>{ssml_text}</speak>"
-
-    synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
-    ext = os.path.splitext(output_path)[1].lower()
-    audio_encoding = (
-        texttospeech.AudioEncoding.LINEAR16
-        if ext == ".wav"
-        else texttospeech.AudioEncoding.MP3
-    )
-    # Journey voices can reject some encodings; use a broadly compatible voice for WAV.
-    voice_name = "en-US-Standard-D" if audio_encoding == texttospeech.AudioEncoding.LINEAR16 else "en-US-Journey-D"
-    voice = texttospeech.VoiceSelectionParams(
-        language_code="en-US",
-        name=voice_name
-    )
-    audio_config = texttospeech.AudioConfig(audio_encoding=audio_encoding)
-
-    response = client.synthesize_speech(
-        input=synthesis_input, voice=voice, audio_config=audio_config
-    )
-
-    with open(output_path, "wb") as out:
-        out.write(response.audio_content)
-    return True
 
 def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini", voice: str | None = None) -> bool:
     import traceback as _tb
@@ -759,29 +601,41 @@ def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini"
                 return False
 
             try:
+                import time as _time
                 client = genai.Client(api_key=api_key)
                 tts_model = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
-                # Caller-supplied voice takes priority, then env var, then default male voice.
                 tts_voice = voice or os.getenv("GEMINI_TTS_VOICE", "puck")
 
-                response = client.models.generate_content(
-                    model=tts_model,
-                    contents=text,
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=f"You are a {tts_voice} voice narrator. Always speak in the same consistent voice throughout.",
-                        response_modalities=["audio"],
-                        speech_config=genai_types.SpeechConfig(
-                            voice_config=genai_types.VoiceConfig(
-                                prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                                    voice_name=tts_voice
+                response = None
+                for _attempt in range(4):
+                    try:
+                        response = client.models.generate_content(
+                            model=tts_model,
+                            contents=text,
+                            config=genai_types.GenerateContentConfig(
+                                response_modalities=["audio"],
+                                speech_config=genai_types.SpeechConfig(
+                                    voice_config=genai_types.VoiceConfig(
+                                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                                            voice_name=tts_voice
+                                        )
+                                    ),
+                                    language_code="en-US",
                                 )
-                            ),
-                            language_code="en-US",
+                            )
                         )
-                    )
-                )
-                
-                if response.candidates and response.candidates[0].content.parts:
+                        break
+                    except Exception as _e:
+                        _msg = str(_e)
+                        if "500" in _msg or "503" in _msg or "INTERNAL" in _msg or "UNAVAILABLE" in _msg:
+                            if _attempt < 3:
+                                _wait = 2 ** _attempt
+                                print(f"[Gemini TTS] Server error (attempt {_attempt+1}), retrying in {_wait}s...")
+                                _time.sleep(_wait)
+                                continue
+                        raise
+
+                if response and response.candidates and response.candidates[0].content.parts:
                     for part in response.candidates[0].content.parts:
                         if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
                             return _save_gemini_audio_bytes(
@@ -792,14 +646,7 @@ def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini"
                 return False
             except Exception as e:
                 print(f"[Gemini TTS] Error:\n{_tb.format_exc()}")
-                try:
-                    return _generate_audio_with_google_tts(text, output_path)
-                except Exception as g_e:
-                    print(f"[Google Cloud TTS] Fallback error:\n{_tb.format_exc()}")
-                    return False
-
-        else:
-            return _generate_audio_with_google_tts(text, output_path)
+                return False
     except Exception as e:
         print(f"[Audio Gen] Unexpected error:\n{_tb.format_exc()}")
 

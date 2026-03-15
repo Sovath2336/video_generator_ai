@@ -38,10 +38,16 @@ def init_db():
             narration TEXT,
             img_path TEXT,
             audio_path TEXT,
+            tts_voice TEXT,
             FOREIGN KEY(topic_id) REFERENCES topics(id)
         )
     ''')
     conn.commit()
+    c.execute("PRAGMA table_info(scenes)")
+    cols = [r[1] for r in c.fetchall()]
+    if 'tts_voice' not in cols:
+        c.execute("ALTER TABLE scenes ADD COLUMN tts_voice TEXT")
+        conn.commit()
     conn.close()
 
 def save_script_and_scenes(topic, duration, script_text, scenes):
@@ -70,11 +76,7 @@ def save_script_and_scenes(topic, duration, script_text, scenes):
     return topic_id
 
 def update_scene_asset(scene_id, asset_type, asset_path):
-    """
-    Updates a specific scene with the generated asset path.
-    asset_type must be either 'img_path' or 'audio_path'
-    """
-    if asset_type not in ['img_path', 'audio_path'] or not scene_id:
+    if asset_type not in ['img_path', 'audio_path', 'tts_voice'] or not scene_id:
         return
         
     conn = get_connection()
@@ -99,7 +101,7 @@ def get_topic_detail(topic_id):
     c.execute('SELECT id, topic, duration, script_text, created_at FROM topics WHERE id = ?', (topic_id,))
     topic_row = c.fetchone()
     c.execute(
-        'SELECT id, scene_order, visual_prompt, narration, img_path, audio_path FROM scenes WHERE topic_id = ? ORDER BY scene_order',
+        'SELECT id, scene_order, visual_prompt, narration, img_path, audio_path, tts_voice FROM scenes WHERE topic_id = ? ORDER BY scene_order',
         (topic_id,)
     )
     scenes = c.fetchall()

@@ -48,6 +48,16 @@ dist/
 *.egg
 .eggs/
 
+# PyInstaller / Inno Setup outputs
+*.spec.bak
+build_log.txt
+build_err.txt
+_run_build.bat
+installer_output/
+Output/
+*.exe
+!.venv/**/*.exe
+
 # pytest / coverage
 .pytest_cache/
 .coverage

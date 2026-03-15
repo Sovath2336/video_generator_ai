@@ -26,12 +26,6 @@ if getattr(sys, 'frozen', False):
         _sh.copy2(_bundled_env, _ENV_PATH)
 
 load_dotenv(_ENV_PATH, override=True)
-if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
-    cred_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-    if not os.path.isabs(cred_path):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), cred_path
-        )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QPushButton, QHBoxLayout, QLineEdit, QMessageBox, QFrame,
@@ -270,6 +264,7 @@ class BulkGenerationThread(QThread):
                 if aud_ok:
                     scene['audio_path'] = aud_path
                     db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
+                    db.update_scene_asset(scene.get('db_id'), 'tts_voice', self.tts_voice or '')
                     self.scene_progress.emit(i, 'aud', '✅ Audio done')
                 else:
                     failed.append(f"Scene {idx} Audio")
@@ -1190,6 +1185,8 @@ class StoryboardTab(QWidget):
                         
                         # Sync String Path to Database
                         db.update_scene_asset(scene.get('db_id'), 'audio_path', path)
+                        db.update_scene_asset(scene.get('db_id'), 'tts_voice', voice or '')
+                        scene['tts_voice'] = voice or ''
                         
                         play_btn.show()
                         play_btn.clicked.connect(lambda: os.startfile(os.path.abspath(path)) if os.name == 'nt' else None)
@@ -1862,9 +1859,10 @@ class HistoryTab(QWidget):
                 'narration': narration,
                 'img_path': img_path or '',
                 'audio_path': audio_path or '',
+                'tts_voice': tts_voice or '',
                 'db_id': sid,
             }
-            for (sid, order, visual, narration, img_path, audio_path) in scenes
+            for (sid, order, visual, narration, img_path, audio_path, tts_voice) in scenes
         ]
 
         # Check for a final video in the topic sub-folder
@@ -2038,6 +2036,18 @@ class HistoryTab(QWidget):
                 idx=i, s=scene, status_lbl=aud_status, btn=gen_aud_btn, play_btn=play_aud_btn
             ):
                 engine, voice = parse_tts_selection(self.history_tts_engine_combo.currentText())
+                stored_voice = s.get('tts_voice', '')
+                if stored_voice and voice and stored_voice != voice:
+                    ans = QMessageBox.warning(
+                        self, "Voice Mismatch",
+                        f"This scene was originally generated with voice <b>{stored_voice}</b>.<br>"
+                        f"You selected <b>{voice}</b>.<br><br>"
+                        "Regenerating with a different voice may cause inconsistency across scenes.<br>"
+                        "Continue anyway?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                    )
+                    if ans != QMessageBox.Yes:
+                        return
                 audio_ext = "wav" if engine == "gemini" else "mp3"
                 out_path = os.path.join(self._history_topic_folder, f"scene_{idx+1}.{audio_ext}")
                 btn.setEnabled(False)
@@ -2052,8 +2062,10 @@ class HistoryTab(QWidget):
                         status_lbl.setText("✅ Audio Saved.")
                         status_lbl.setStyleSheet("color: #a6e3a1;")
                         s['audio_path'] = path
+                        s['tts_voice'] = voice
                         self._history_scene_audio_paths[idx] = path
                         db.update_scene_asset(s.get('db_id'), 'audio_path', path)
+                        db.update_scene_asset(s.get('db_id'), 'tts_voice', voice or '')
                         play_btn.show()
                         try:
                             play_btn.clicked.disconnect()

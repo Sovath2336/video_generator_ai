@@ -11,7 +11,6 @@ added_files = [
     (os.path.join(project_dir, 'db.py'),              '.'),
     (os.path.join(project_dir, 'ai_generator.py'),    '.'),
     (os.path.join(project_dir, '.ffmpeg_bin', 'ffmpeg.exe'), '.ffmpeg_bin'),
-    (os.path.join(project_dir, 'gen-lang-client-0347255924-598b1319c8a4.json'), '.'),
     (os.path.join(project_dir, 'app_icon.ico'),       '.'),
     (os.path.join(project_dir, '.env'),                '.'),
 ]
@@ -20,28 +19,37 @@ hidden_imports = [
     'PyQt5.QtMultimedia',
     'PyQt5.sip',
     'google.genai',
-    'google.cloud.texttospeech',
+    'google.api_core',
+    'google.auth',
     'moviepy.editor',
     'moviepy.video.io.VideoFileClip',
     'moviepy.audio.io.AudioFileClip',
     'PIL._tkinter_finder',
     'imageio_ffmpeg',
     'pydub',
+    'pydub.utils',
     'sqlite3',
     'dotenv',
+    'webbrowser',
 ]
 
 hidden_imports += collect_submodules('google.genai')
-hidden_imports += collect_submodules('google.cloud.texttospeech')
+hidden_imports += collect_submodules('google.api_core')
+hidden_imports += collect_submodules('google.auth')
 hidden_imports += collect_submodules('moviepy')
 
 added_files += collect_data_files('moviepy')
 added_files += collect_data_files('imageio_ffmpeg')
 added_files += collect_data_files('imageio')
+added_files += collect_data_files('certifi')
 
-for _pkg in ['imageio', 'imageio_ffmpeg', 'moviepy', 'PIL', 'google-generativeai',
-             'google-genai', 'requests', 'certifi', 'charset-normalizer',
-             'pydub', 'python-dotenv']:
+for _pkg in [
+    'imageio', 'imageio_ffmpeg', 'moviepy', 'Pillow', 'PIL',
+    'google-generativeai', 'google-genai',
+    'google-api-core', 'google-auth',
+    'requests', 'certifi', 'charset-normalizer', 'urllib3',
+    'pydub', 'python-dotenv', 'numpy', 'decorator',
+]:
     try:
         added_files += copy_metadata(_pkg)
     except Exception:
