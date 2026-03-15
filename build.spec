@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import sys
 import os
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 block_cipher = None
 
@@ -13,6 +13,7 @@ added_files = [
     (os.path.join(project_dir, '.ffmpeg_bin', 'ffmpeg.exe'), '.ffmpeg_bin'),
     (os.path.join(project_dir, 'gen-lang-client-0347255924-598b1319c8a4.json'), '.'),
     (os.path.join(project_dir, 'app_icon.ico'),       '.'),
+    (os.path.join(project_dir, '.env'),                '.'),
 ]
 
 hidden_imports = [
@@ -36,6 +37,15 @@ hidden_imports += collect_submodules('moviepy')
 
 added_files += collect_data_files('moviepy')
 added_files += collect_data_files('imageio_ffmpeg')
+added_files += collect_data_files('imageio')
+
+for _pkg in ['imageio', 'imageio_ffmpeg', 'moviepy', 'PIL', 'google-generativeai',
+             'google-genai', 'requests', 'certifi', 'charset-normalizer',
+             'pydub', 'python-dotenv']:
+    try:
+        added_files += copy_metadata(_pkg)
+    except Exception:
+        pass
 
 a = Analysis(
     [os.path.join(project_dir, 'main.py')],

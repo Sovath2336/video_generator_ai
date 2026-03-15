@@ -1,7 +1,17 @@
 import sqlite3
 import os
+import sys
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'video_generator.db')
+def _get_data_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        base = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')),
+                            'InfographicVideoGenerator')
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+DB_PATH = os.path.join(_get_data_dir(), 'video_generator.db')
 
 def get_connection():
     # Use check_same_thread=False so we can do simple updates from background QThreads

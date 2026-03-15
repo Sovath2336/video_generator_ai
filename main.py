@@ -7,8 +7,25 @@ import tempfile
 import shutil
 from dotenv import load_dotenv
 
-# Load env variables and fix Google Credentials path to be relative to this file
-load_dotenv()
+def _get_app_data_base() -> str:
+    if getattr(sys, 'frozen', False):
+        base = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')),
+                            'InfographicVideoGenerator')
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+_ENV_PATH = os.path.join(_get_app_data_base(), ".env")
+
+# On first frozen run, copy bundled .env into writable location if it doesn't exist yet
+if getattr(sys, 'frozen', False):
+    _bundled_env = os.path.join(sys._MEIPASS, ".env")
+    if os.path.exists(_bundled_env) and not os.path.exists(_ENV_PATH):
+        import shutil as _sh
+        _sh.copy2(_bundled_env, _ENV_PATH)
+
+load_dotenv(_ENV_PATH, override=True)
 if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
     cred_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
     if not os.path.isabs(cred_path):
@@ -46,8 +63,6 @@ _GEMINI_VOICE_MAP = {
     "leda": "leda",
 }
 
-_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-
 def _load_env():
     from dotenv import load_dotenv as _load
     _load(_ENV_PATH, override=True)
@@ -74,6 +89,9 @@ def parse_tts_selection(combo_text: str):
     m = _re.search(r"—\s+(\w+)\s+\(", combo_text)
     voice = m.group(1).lower() if m else "kore"
     return "gemini", voice
+
+def _app_data_dir() -> str:
+    return _get_app_data_base()
 
 def make_safe_topic(topic: str) -> str:
     """Returns a filesystem-safe folder/file name derived from the topic."""
@@ -1022,7 +1040,7 @@ class StoryboardTab(QWidget):
 
     def load_scenes(self, scenes, topic=''):
         self._topic_folder = os.path.join(
-            os.path.dirname(__file__), 'assets', make_safe_topic(topic)
+            _app_data_dir(), 'assets', make_safe_topic(topic)
         )
         os.makedirs(self._topic_folder, exist_ok=True)
                 
@@ -1809,7 +1827,7 @@ class HistoryTab(QWidget):
             return
 
         topic_folder = os.path.join(
-            os.path.dirname(__file__), 'assets', make_safe_topic(topic)
+            _app_data_dir(), 'assets', make_safe_topic(topic)
         )
         self._audio_player.stop()
         self._audio_player_scene_idx = None
@@ -1851,7 +1869,7 @@ class HistoryTab(QWidget):
 
         # Check for a final video in the topic sub-folder
         safe_topic = make_safe_topic(topic)
-        video_path = os.path.join(os.path.dirname(__file__), 'assets', safe_topic, f"{safe_topic}.mp4")
+        video_path = os.path.join(_app_data_dir(), 'assets', safe_topic, f"{safe_topic}.mp4")
         if os.path.exists(video_path):
             self._current_video_path = video_path
             self.video_lbl.setText(f"✅ {os.path.basename(video_path)}")
@@ -1879,7 +1897,7 @@ class HistoryTab(QWidget):
             self.open_folder_btn.hide()
 
         self._history_topic_folder = os.path.join(
-            os.path.dirname(__file__), 'assets', make_safe_topic(topic)
+            _app_data_dir(), 'assets', make_safe_topic(topic)
         )
         os.makedirs(self._history_topic_folder, exist_ok=True)
         self._audio_player.stop()
@@ -2816,7 +2834,7 @@ class AppWindow(QMainWindow):
         if not self.current_topic:
             return ""
         safe_topic = make_safe_topic(self.current_topic)
-        return os.path.join(os.path.dirname(__file__), 'assets', safe_topic, f"{safe_topic}.mp4")
+        return os.path.join(_app_data_dir(), 'assets', safe_topic, f"{safe_topic}.mp4")
 
     def on_script_next(self, scenes):
         self.current_scenes = scenes
@@ -2850,7 +2868,7 @@ class AppWindow(QMainWindow):
 
         # Video goes into the same topic sub-folder
         safe_topic = make_safe_topic(self.current_topic)
-        topic_folder = os.path.join(os.path.dirname(__file__), 'assets', safe_topic)
+        topic_folder = os.path.join(_app_data_dir(), 'assets', safe_topic)
         os.makedirs(topic_folder, exist_ok=True)
         out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
 
@@ -2877,7 +2895,7 @@ class AppWindow(QMainWindow):
     def on_history_restitch(self, scenes, topic):
         """Triggered by History tab Re-Stitch button — runs stitch in background, reports back inline."""
         safe_topic = make_safe_topic(topic)
-        topic_folder = os.path.join(os.path.dirname(__file__), 'assets', safe_topic)
+        topic_folder = os.path.join(_app_data_dir(), 'assets', safe_topic)
         os.makedirs(topic_folder, exist_ok=True)
         out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
 
@@ -3062,11 +3080,13 @@ if __name__ == '__main__':
     window = AppWindow()
     window.show()
 
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not gemini_key or gemini_key == "your_gemini_api_key_here":
-        dlg = ApiKeyDialog(window)
-        dlg.exec_()
-        _load_env()
+    def _check_api_key():
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not gemini_key or gemini_key == "your_gemini_api_key_here":
+            dlg = ApiKeyDialog(window)
+            dlg.exec_()
+            _load_env()
 
+    QTimer.singleShot(300, _check_api_key)
     sys.exit(app.exec_())
 
