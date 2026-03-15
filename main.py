@@ -70,13 +70,10 @@ def _save_env_key(key: str, value: str):
     os.environ[key] = value
 
 def parse_tts_selection(combo_text: str):
-    """Return (engine, voice_or_None) from a TTS combo label."""
-    if combo_text.startswith("Gemini"):
-        import re as _re
-        m = _re.search(r"—\s+(\w+)\s+\(", combo_text)
-        voice = m.group(1).lower() if m else "kore"
-        return "gemini", voice
-    return "google", None
+    import re as _re
+    m = _re.search(r"—\s+(\w+)\s+\(", combo_text)
+    voice = m.group(1).lower() if m else "kore"
+    return "gemini", voice
 
 def make_safe_topic(topic: str) -> str:
     """Returns a filesystem-safe folder/file name derived from the topic."""
@@ -974,7 +971,6 @@ class StoryboardTab(QWidget):
             "Gemini — Kore (Female)",
             "Gemini — Aoede (Female)",
             "Gemini — Leda (Female)",
-            "Google Cloud (Journey-D)",
         ])
         self.tts_engine_combo.setCurrentText("Gemini — Kore (Female)")
         self.tts_engine_combo.setToolTip("Select the Text-to-Speech voice. Gemini voices are locked to a single gender per call.")
@@ -1697,7 +1693,6 @@ class HistoryTab(QWidget):
             "Gemini — Kore (Female)",
             "Gemini — Aoede (Female)",
             "Gemini — Leda (Female)",
-            "Google Cloud (Journey-D)",
         ])
         self.history_tts_engine_combo.setCurrentText("Gemini — Kore (Female)")
         self.history_tts_engine_combo.setToolTip("Select TTS voice for history scene audio generation.")
@@ -2386,12 +2381,37 @@ class ApiKeyDialog(QDialog):
         title.setProperty("class", "h2")
         layout.addWidget(title)
 
-        info = QLabel(
-            "A Gemini API key is required to generate scripts, images, and audio.\n"
-            "Get your free key at: console.cloud.google.com or ai.google.dev"
-        )
+        info = QLabel("A Gemini API key is required to generate scripts, images, and audio.")
         info.setWordWrap(True)
         layout.addWidget(info)
+
+        steps_frame = QFrame()
+        steps_frame.setStyleSheet("background: #1e1e2e; border-radius: 6px; padding: 4px;")
+        steps_layout = QVBoxLayout(steps_frame)
+        steps_layout.setContentsMargins(12, 10, 12, 10)
+        steps_layout.setSpacing(4)
+
+        steps_title = QLabel("How to get your free API key:")
+        steps_title.setStyleSheet("font-weight: bold; color: #89b4fa; font-size: 12px;")
+        steps_layout.addWidget(steps_title)
+
+        steps = [
+            "1. Open: https://aistudio.google.com/app/apikey",
+            "2. Sign in with your Google account",
+            "3. Click \"Create API key\"",
+            "4. Copy and paste it below",
+        ]
+        for step in steps:
+            lbl = QLabel(step)
+            lbl.setStyleSheet("color: #cdd6f4; font-size: 12px;")
+            steps_layout.addWidget(lbl)
+
+        open_btn = QPushButton("🌐 Open Google AI Studio")
+        open_btn.setProperty("class", "secondary-button")
+        open_btn.setFixedHeight(28)
+        open_btn.clicked.connect(lambda: __import__('webbrowser').open("https://aistudio.google.com/app/apikey"))
+        steps_layout.addWidget(open_btn)
+        layout.addWidget(steps_frame)
 
         key_row = QHBoxLayout()
         self.key_input = QLineEdit()
@@ -2504,11 +2524,198 @@ class SettingsTab(QWidget):
         QTimer.singleShot(3000, lambda: self.status_lbl.setText(""))
 
 
+class HowToUseTab(QWidget):
+    _CONTENT = [
+        ("🔑 Gemini API Key", """
+<b>Step 1:</b> Go to <a href="https://aistudio.google.com/app/apikey" style="color:#89b4fa;">https://aistudio.google.com/app/apikey</a><br>
+<b>Step 2:</b> Sign in with your Google account.<br>
+<b>Step 3:</b> Click <b>Create API key</b> and copy the generated key.<br>
+<b>Step 4:</b> Open the <b>⚙️ Settings</b> tab, paste your key, and click <b>💾 Save API Key</b>.<br><br>
+<i>The key is stored locally in your <code>.env</code> file and never sent anywhere except directly to Google's API.</i>
+"""),
+        ("✍️ Generating a Script", """
+<b>From Topic (AI-generated):</b><br>
+1. Go to the <b>✍️ Scripting</b> tab.<br>
+2. Select <b>Generate from Topic</b>.<br>
+3. Type your topic (e.g. "How black holes form").<br>
+4. Set the desired video duration in minutes.<br>
+5. Optionally enable <b>🌐 Web Search</b> to ground the script in current facts.<br>
+6. Click <b>Generate Script</b>. Gemini will write a full multi-scene documentary script.<br><br>
+<b>From Your Own Text:</b><br>
+1. Select <b>Analyze Text</b>.<br>
+2. Paste your article, notes, or essay.<br>
+3. Click <b>Analyze</b>. The AI splits it into scenes automatically.
+"""),
+        ("🌐 Web Search Mode", """
+When enabled, the AI searches the web for up-to-date information before writing the script.<br><br>
+• Best for news topics, recent events, or anything time-sensitive.<br>
+• Slightly slower than pure AI generation.<br>
+• The resulting script will cite real, current facts rather than relying solely on training data.<br><br>
+Toggle it with the <b>🌐 Web Search</b> checkbox on the Scripting tab before clicking Generate.
+"""),
+        ("🎨 Generating Scenes", """
+After a script is generated you land on the <b>🎨 Storyboard</b> tab.<br><br>
+<b>Auto-generate everything at once:</b><br>
+Click <b>⚡ Auto-Generate All Scenes</b> — images and audio are generated in parallel for every scene.<br><br>
+<b>Generate individually:</b><br>
+Each scene card has:<br>
+&nbsp;&nbsp;• <b>🖼 Generate Image</b> — creates an AI image for that scene's visual prompt.<br>
+&nbsp;&nbsp;• <b>🎙 Generate Audio</b> — synthesises the narration using the selected TTS voice.<br>
+&nbsp;&nbsp;• <b>👁️ View Image</b> — preview the generated image.<br>
+&nbsp;&nbsp;• <b>▶️ Play Audio</b> — listen to the narration.<br><br>
+<b>TTS Voice:</b> Choose from the dropdown at the top of the Storyboard tab. Default is <b>Kore (Female)</b>.
+"""),
+        ("🎬 Stitching the Video", """
+Once all scenes have both an image and audio:<br><br>
+1. Go to the <b>🎬 Export Video</b> tab.<br>
+2. The button will read <b>🎬 Stitch Final Video</b> (disabled if no scenes are ready).<br>
+3. Click it — the app combines all scene images, audio, zoom animations, and subtitles into a single MP4.<br>
+4. Progress is shown live. A desktop notification appears when done.<br>
+5. Use <b>🎬 View Video</b> or <b>📂 Open Folder</b> to find the output.<br><br>
+The video is saved inside <code>assets/&lt;topic&gt;/&lt;topic&gt;.mp4</code>.
+"""),
+        ("🔁 Re-Stitching", """
+Already stitched a video but want to change something?<br><br>
+• After a successful stitch the button changes to <b>🔁 Re-Stitch Video</b>.<br>
+• Re-generate individual images or audio on the Storyboard, then re-stitch.<br>
+• Re-stitching overwrites the previous MP4.<br><br>
+<b>From History:</b><br>
+Open the <b>📚 History</b> tab, select a past project, and click <b>🔁 Re-Stitch</b> to rebuild it.
+"""),
+        ("📚 History", """
+The <b>📚 History</b> tab keeps a record of every project you've generated.<br><br>
+• Click any project to expand its scenes.<br>
+• Re-generate individual scene images or audio using the same controls as the Storyboard.<br>
+• Click <b>🔁 Re-Stitch</b> to rebuild the video from updated assets.<br>
+• Projects are stored in a local SQLite database (<code>video_generator.db</code>).
+"""),
+        ("🎙 TTS Voices", """
+<b>Gemini voices</b> (cloud-based, free tier available):<br>
+&nbsp;&nbsp;• <b>Kore</b> — Female (default)<br>
+&nbsp;&nbsp;• <b>Aoede</b> — Female<br>
+&nbsp;&nbsp;• <b>Leda</b> — Female<br>
+&nbsp;&nbsp;• <b>Puck</b> — Male<br>
+&nbsp;&nbsp;• <b>Charon</b> — Male<br>
+&nbsp;&nbsp;• <b>Fenrir</b> — Male<br><br>
+Select your preferred voice from the dropdown at the top of the Storyboard or History tab before generating audio.
+"""),
+        ("⚙️ Settings", """
+The <b>⚙️ Settings</b> tab lets you manage your API key:<br><br>
+• <b>💾 Save API Key</b> — saves your Gemini API key to the local <code>.env</code> file.<br>
+• <b>👁 Show Key / 🙈 Hide Key</b> — toggles key visibility.<br>
+• Changes take effect immediately without restarting the app.<br><br>
+<i>On first launch, a prompt will automatically ask for your API key if none is found.</i>
+"""),
+        ("💡 Tips & Troubleshooting", """
+<b>Video stitching fails:</b><br>
+&nbsp;&nbsp;→ Make sure all scenes have both an image and audio generated before stitching.<br><br>
+<b>Images or audio not generating:</b><br>
+&nbsp;&nbsp;→ Check your Gemini API key in Settings. Ensure you have an active internet connection.<br><br>
+<b>Subtitles look off:</b><br>
+&nbsp;&nbsp;→ Subtitles are auto-aligned to speech. Short scenes may have less precise timing.<br><br>
+<b>Video duration feels too short/long:</b><br>
+&nbsp;&nbsp;→ Adjust the duration slider on the Scripting tab before generating.<br><br>
+<b>Re-stitch to apply changes:</b><br>
+&nbsp;&nbsp;→ Any time you regenerate an image or audio for a scene, re-stitch to get the updated video.
+"""),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Left: topic list ──────────────────────────────────────────────
+        left_panel = QWidget()
+        left_panel.setFixedWidth(220)
+        left_panel.setStyleSheet("background: #181825; border-right: 1px solid #313244;")
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+
+        left_header = QLabel("  How to Use")
+        left_header.setFixedHeight(48)
+        left_header.setStyleSheet(
+            "background: #1e1e2e; color: #cdd6f4; font-weight: bold; font-size: 13px;"
+            "border-bottom: 1px solid #313244; padding-left: 8px;"
+        )
+        left_layout.addWidget(left_header)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet("""
+            QListWidget {
+                background: transparent;
+                border: none;
+                outline: none;
+                font-size: 13px;
+                color: #a6adc8;
+            }
+            QListWidget::item {
+                padding: 10px 16px;
+                border-bottom: 1px solid #1e1e2e;
+            }
+            QListWidget::item:selected {
+                background: #313244;
+                color: #cdd6f4;
+                border-left: 3px solid #89b4fa;
+            }
+            QListWidget::item:hover:!selected {
+                background: #242434;
+                color: #cdd6f4;
+            }
+        """)
+        for title, _ in self._CONTENT:
+            self._list.addItem(title)
+        left_layout.addWidget(self._list)
+        root.addWidget(left_panel)
+
+        # ── Right: content area ───────────────────────────────────────────
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        self._content_title = QLabel()
+        self._content_title.setFixedHeight(48)
+        self._content_title.setStyleSheet(
+            "background: #1e1e2e; color: #cdd6f4; font-weight: bold; font-size: 14px;"
+            "border-bottom: 1px solid #313244; padding-left: 24px;"
+        )
+        right_layout.addWidget(self._content_title)
+
+        self._content_browser = QTextBrowser()
+        self._content_browser.setOpenExternalLinks(True)
+        self._content_browser.setFrameShape(QFrame.NoFrame)
+        self._content_browser.setStyleSheet(
+            "background: #1e1e2e; color: #cdd6f4; font-size: 13px; padding: 24px;"
+        )
+        right_layout.addWidget(self._content_browser)
+        root.addWidget(right_panel, 1)
+
+        self._list.currentRowChanged.connect(self._on_select)
+        self._list.setCurrentRow(0)
+
+    def _on_select(self, row: int):
+        if row < 0 or row >= len(self._CONTENT):
+            return
+        title, html = self._CONTENT[row]
+        self._content_title.setText(f"  {title}")
+        self._content_browser.setHtml(
+            f"<div style='color:#cdd6f4; font-size:13px; line-height:1.8;'>{html.strip()}</div>"
+        )
+
+
+
 class AppWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Infographic Video Generator")
         self.resize(1530, 825)
+
+        _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        if os.path.exists(_icon_path):
+            self.setWindowIcon(QIcon(_icon_path))
         
         QTimer.singleShot(0, self._apply_dark_title_bar)
         
@@ -2520,12 +2727,14 @@ class AppWindow(QMainWindow):
         self.export_tab = ExportTab()
         self.history_tab = HistoryTab()
         self.settings_tab = SettingsTab()
+        self.howto_tab = HowToUseTab()
         
         self.tabs.addTab(self.script_tab, "✍️ Scripting")
         self.tabs.addTab(self.storyboard_tab, "🎨 Storyboard")
         self.tabs.addTab(self.export_tab, "🎬 Export Video")
         self.tabs.addTab(self.history_tab, "📚 History")
         self.tabs.addTab(self.settings_tab, "⚙️ Settings")
+        self.tabs.addTab(self.howto_tab, "❓ How to Use")
         
         self.setCentralWidget(self.tabs)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -2847,6 +3056,9 @@ if __name__ == '__main__':
     db.init_db()
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+    _app_icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+    if os.path.exists(_app_icon_path):
+        app.setWindowIcon(QIcon(_app_icon_path))
     window = AppWindow()
     window.show()
 

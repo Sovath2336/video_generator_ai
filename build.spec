@@ -12,6 +12,7 @@ added_files = [
     (os.path.join(project_dir, 'ai_generator.py'),    '.'),
     (os.path.join(project_dir, '.ffmpeg_bin', 'ffmpeg.exe'), '.ffmpeg_bin'),
     (os.path.join(project_dir, 'gen-lang-client-0347255924-598b1319c8a4.json'), '.'),
+    (os.path.join(project_dir, 'app_icon.ico'),       '.'),
 ]
 
 hidden_imports = [
@@ -66,7 +67,7 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
-    icon=None,
+    icon=os.path.join(project_dir, 'app_icon.ico'),
 )
 
 coll = COLLECT(

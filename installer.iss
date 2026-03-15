@@ -3,6 +3,7 @@
 #define AppPublisher "Your Name"
 #define AppURL       "https://yourwebsite.com"
 #define AppExeName   "VideoGeneratorAI.exe"
+#define AppIconFile  "app_icon.ico"
 #define DistDir      "dist\VideoGeneratorAI"
 
 [Setup]
@@ -26,6 +27,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64os
 CloseApplications=yes
 UninstallDisplayName={#AppName}
+SetupIconFile={#AppIconFile}
 UninstallDisplayIcon={app}\{#AppExeName}
 MinVersion=10.0
 
@@ -39,9 +41,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#AppName}";    DestPath: "{app}\{#AppExeName}"
-Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{group}\{#AppName}";               Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app_icon.ico"
+Name: "{group}\Uninstall {#AppName}";     Filename: "{uninstallexe}"
+Name: "{commondesktop}\{#AppName}";       Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app_icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
