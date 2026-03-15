@@ -64,8 +64,9 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
     try:
         client = genai.Client(api_key=api_key)
         
-        estimated_scenes_min = int(duration_minutes * 4) + 1
-        estimated_scenes_max = estimated_scenes_min + 3
+        estimated_scenes_min = max(6, int(duration_minutes * 1.5) + 1)
+        estimated_scenes_max = max(8, int(duration_minutes * 2) + 2)
+        words_per_scene = int((duration_minutes * 140) / ((estimated_scenes_min + estimated_scenes_max) / 2))
 
         web_note = (
             "You have access to Google Search. Before writing, SEARCH the web for the most "
@@ -84,6 +85,7 @@ Write a complete, YouTube-ready infographic video script about: "{topic}"
 
 TARGET: Exactly {duration_minutes} minutes of narration (~{duration_minutes * 140} words total across all scenes).
 SCENES: Generate between {estimated_scenes_min} and {estimated_scenes_max} scenes.
+NARRATION PER SCENE: Each main content scene must have ~{words_per_scene} words of narration (minimum {int(words_per_scene * 0.8)}, maximum {int(words_per_scene * 1.2)}). Do NOT write short 1-2 sentence narrations. Each scene should feel like a full paragraph of documentary narration.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MANDATORY SCENE STRUCTURE
@@ -103,7 +105,7 @@ Each scene must:
 • Build on the last idea — use transition phrases ("But here's where it gets interesting…", "This leads us to…", "Now consider this…").
 • Cover one focused idea, fact, or narrative beat — not a list dump.
 - Have a visual that directly and vividly illustrates that scene's core narration idea (no generic stock-photo concepts, no random symbolic filler).
-• Have narration that feels conversational, curious, and authoritative — like a great documentary.
+• Have narration that feels conversational, curious, and authoritative — like a great documentary. Write full, rich paragraphs (~{words_per_scene} words). Do NOT write only 1-2 sentences per scene.
 • The final MAIN CONTENT scene must end the educational/story content naturally before any call to action appears.
 • Do NOT ask viewers to like, subscribe, or hit the bell in any main content scene.
 • Do NOT use the title card visual style again after Scene 1.
@@ -188,7 +190,7 @@ Narration: This is where the real narration begins. Open with a powerful hook �
 • Order them so each scene flows naturally FROM the previous and INTO the next — use bridging phrases ("But here's the twist…", "This brings us to…", "Now consider…").
 • One focused idea per scene — no list dumps.
 - Visuals must directly illustrate the core idea of that scene's narration (vivid lighting, mood, composition, colours - no generic concepts, no random symbolic filler). No readable text, letters, captions, or typography.
-• Narration must be conversational, curious, and authoritative — faithful to the source text's facts.
+• Narration must be conversational, curious, and authoritative — faithful to the source text's facts. Write full rich paragraphs of 60-100 words per scene. Do NOT write short 1-2 sentence narrations.
 • The final MAIN CONTENT scene must finish the actual explanation before any call to action appears.
 • Do NOT ask viewers to like, subscribe, or hit the bell in any main content scene.
 • Do NOT use the title card visual style again after Scene 1.
@@ -749,11 +751,7 @@ def _generate_audio_with_google_tts(text: str, output_path: str) -> bool:
     return True
 
 def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini", voice: str | None = None) -> bool:
-    """
-    Uses Google Cloud TTS or Gemini TTS to synthesize audio from text and saves it to output_path.
-    Returns True if successful, False otherwise.
-    The `voice` parameter overrides GEMINI_TTS_VOICE for Gemini engine calls.
-    """
+    import traceback as _tb
     try:
         if engine == "gemini":
             api_key = os.getenv("GEMINI_API_KEY")
@@ -770,6 +768,7 @@ def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini"
                     model=tts_model,
                     contents=text,
                     config=genai_types.GenerateContentConfig(
+                        system_instruction=f"You are a {tts_voice} voice narrator. Always speak in the same consistent voice throughout.",
                         response_modalities=["audio"],
                         speech_config=genai_types.SpeechConfig(
                             voice_config=genai_types.VoiceConfig(
@@ -792,18 +791,18 @@ def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini"
                             )
                 return False
             except Exception as e:
-                print(f"Gemini Audio Gen Error: {e}")
+                print(f"[Gemini TTS] Error:\n{_tb.format_exc()}")
                 try:
                     return _generate_audio_with_google_tts(text, output_path)
                 except Exception as g_e:
-                    print(f"Google Cloud TTS fallback error: {g_e}")
+                    print(f"[Google Cloud TTS] Fallback error:\n{_tb.format_exc()}")
                     return False
 
-        else: # Google Cloud TTS
+        else:
             return _generate_audio_with_google_tts(text, output_path)
     except Exception as e:
-        print(f"Audio Gen Error: {e}")
-        
+        print(f"[Audio Gen] Unexpected error:\n{_tb.format_exc()}")
+
     return False
 
 def generate_and_mix_audio(

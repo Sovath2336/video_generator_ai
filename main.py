@@ -46,13 +46,35 @@ _GEMINI_VOICE_MAP = {
     "leda": "leda",
 }
 
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+def _load_env():
+    from dotenv import load_dotenv as _load
+    _load(_ENV_PATH, override=True)
+
+def _save_env_key(key: str, value: str):
+    lines = []
+    if os.path.exists(_ENV_PATH):
+        with open(_ENV_PATH, "r") as f:
+            lines = f.readlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}\n"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}\n")
+    with open(_ENV_PATH, "w") as f:
+        f.writelines(lines)
+    os.environ[key] = value
+
 def parse_tts_selection(combo_text: str):
     """Return (engine, voice_or_None) from a TTS combo label."""
     if combo_text.startswith("Gemini"):
-        # Extract voice name between "— " and " ("
         import re as _re
         m = _re.search(r"—\s+(\w+)\s+\(", combo_text)
-        voice = m.group(1).lower() if m else "puck"
+        voice = m.group(1).lower() if m else "kore"
         return "gemini", voice
     return "google", None
 
@@ -144,7 +166,7 @@ class ImageGenerationThread(QThread):
         self.finished.emit(success, self.output_path)
 
 class AudioGenerationThread(QThread):
-    finished = pyqtSignal(bool, str)
+    finished = pyqtSignal(bool, str, str)
 
     def __init__(self, text, output_path, engine="gemini", voice=None):
         super().__init__()
@@ -154,8 +176,13 @@ class AudioGenerationThread(QThread):
         self.voice = voice
 
     def run(self):
-        success = generate_audio_from_text(self.text, self.output_path, self.engine, self.voice)
-        self.finished.emit(success, self.output_path)
+        import traceback as _tb
+        try:
+            success = generate_audio_from_text(self.text, self.output_path, self.engine, self.voice)
+            self.finished.emit(success, self.output_path, "" if success else "generate_audio_from_text returned False")
+        except Exception as e:
+            print(f"AudioGenerationThread error:\n{_tb.format_exc()}")
+            self.finished.emit(False, self.output_path, str(e))
 
 class BulkGenerationThread(QThread):
     """
@@ -292,90 +319,113 @@ class VideoStitchingThread(QThread):
                 return path
         return ""
 
+    _SUBTITLE_MAX_WORDS = 12
+
+    @staticmethod
+    def _sentence_word_spans(narration: str) -> list:
+        max_w = VideoStitchingThread._SUBTITLE_MAX_WORDS
+        sentence_re = re.compile(r'[^.!?]+[.!?]*', re.UNICODE)
+        word_re = re.compile(r"[A-Za-z0-9]+(?:[\x27’][A-Za-z0-9]+)*", re.UNICODE)
+        spans = []
+        for sent_m in sentence_re.finditer(narration):
+            sent_text = sent_m.group()
+            sent_start = sent_m.start()
+            words = list(word_re.finditer(sent_text))
+            if not words:
+                continue
+            if len(words) <= max_w:
+                spans.append((sent_start + words[0].start(), sent_start + words[-1].end()))
+            else:
+                n_parts = (len(words) + max_w - 1) // max_w
+                per_part = len(words) // n_parts
+                remainder = len(words) % n_parts
+                idx = 0
+                for p in range(n_parts):
+                    count = per_part + (1 if p < remainder else 0)
+                    part_words = words[idx: idx + count]
+                    spans.append((sent_start + part_words[0].start(), sent_start + part_words[-1].end()))
+                    idx += count
+        return spans
+
     @staticmethod
     def _fallback_subtitle_chunks(narration: str, duration: float) -> list:
-        """
-        Guaranteed subtitle fallback for any non-empty narration.
-        Keeps punctuation from the script and distributes chunks evenly.
-        """
         narration = (narration or "").strip()
         if not narration or duration <= 0:
             return []
-
-        word_matches = list(re.finditer(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*", narration))
-        if not word_matches:
+        spans = VideoStitchingThread._sentence_word_spans(narration)
+        if not spans:
             return [{"text": narration, "start_sec": 0.0, "end_sec": duration}]
-
-        chunk_ranges = []
-        for i in range(0, len(word_matches), 10):
-            next_index = i + 10
-            start_char = 0 if i == 0 else word_matches[i].start()
-            end_char = len(narration) if next_index >= len(word_matches) else word_matches[next_index].start()
-            chunk_text = narration[start_char:end_char].strip()
-            if chunk_text:
-                chunk_ranges.append(chunk_text)
-
-        if not chunk_ranges:
+        texts = [narration[s:e].strip() for s, e in spans if narration[s:e].strip()]
+        if not texts:
             return [{"text": narration, "start_sec": 0.0, "end_sec": duration}]
-
-        step = duration / len(chunk_ranges)
+        step = duration / len(texts)
         return [
             {
                 "text": text,
                 "start_sec": step * idx,
-                "end_sec": duration if idx == len(chunk_ranges) - 1 else step * (idx + 1),
+                "end_sec": duration if idx == len(texts) - 1 else step * (idx + 1),
             }
-            for idx, text in enumerate(chunk_ranges)
+            for idx, text in enumerate(texts)
         ]
 
     @staticmethod
     def _subtitle_chunks(narration: str, word_timings: list, duration: float) -> list:
-        """
-        Group subtitles in chunks of up to 10 spoken words while preserving
-        the original punctuation from the script text.
-        """
         narration = narration or ""
         if not narration.strip():
             return []
         if not word_timings:
             return VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
-
-        word_matches = list(re.finditer(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*", narration))
+        word_re = re.compile(r"[A-Za-z0-9]+(?:[\x27’][A-Za-z0-9]+)*", re.UNICODE)
+        word_matches = list(word_re.finditer(narration))
+        spans = VideoStitchingThread._sentence_word_spans(narration)
+        if not spans:
+            return VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
         if len(word_matches) != len(word_timings):
-            chunks = [
-                {
-                    "text": " ".join(word.get("text", "") for word in word_timings[i:i + 10]).strip(),
-                    "start_sec": max(0.0, float(word_timings[i].get("start_sec", 0.0))),
-                    "end_sec": (
-                        duration
-                        if i + 10 >= len(word_timings)
-                        else max(0.0, float(word_timings[i + 10].get("start_sec", duration)))
-                    ),
-                }
-                for i in range(0, len(word_timings), 10)
-            ]
-            return [chunk for chunk in chunks if chunk.get("text")] or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
-
+            chunks = []
+            for span_idx, (s, e) in enumerate(spans):
+                span_text = narration[s:e].strip()
+                if not span_text:
+                    continue
+                span_wm = list(word_re.finditer(narration, s, e))
+                if not span_wm:
+                    continue
+                first_pos = sum(1 for m in word_matches if m.start() < span_wm[0].start())
+                first_pos = min(first_pos, len(word_timings) - 1)
+                start_sec = max(0.0, float(word_timings[first_pos].get("start_sec", 0.0)))
+                if span_idx + 1 < len(spans):
+                    ns, _ = spans[span_idx + 1]
+                    nwm = list(word_re.finditer(narration, ns))
+                    if nwm:
+                        nwp = min(sum(1 for m in word_matches if m.start() < nwm[0].start()), len(word_timings) - 1)
+                        end_sec = max(0.0, float(word_timings[nwp].get("start_sec", duration)))
+                    else:
+                        end_sec = duration
+                else:
+                    end_sec = duration
+                chunks.append({"text": span_text, "start_sec": start_sec, "end_sec": end_sec})
+            return chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
         chunks = []
-        for i in range(0, len(word_timings), 10):
-            next_index = i + 10
-            start_char = 0 if i == 0 else word_matches[i].start()
-            end_char = len(narration) if next_index >= len(word_matches) else word_matches[next_index].start()
-            chunk_text = narration[start_char:end_char].strip()
-            if not chunk_text:
+        for span_idx, (s, e) in enumerate(spans):
+            span_text = narration[s:e].strip()
+            if not span_text:
                 continue
-            chunks.append(
-                {
-                    "text": chunk_text,
-                    "start_sec": max(0.0, float(word_timings[i].get("start_sec", 0.0))),
-                    "end_sec": (
-                        duration
-                        if next_index >= len(word_timings)
-                        else max(0.0, float(word_timings[next_index].get("start_sec", duration)))
-                    ),
-                }
-            )
+            span_word_indices = [j for j, m in enumerate(word_matches) if m.start() >= s and m.end() <= e + 1]
+            if not span_word_indices:
+                continue
+            first_idx = span_word_indices[0]
+            start_sec = max(0.0, float(word_timings[first_idx].get("start_sec", 0.0)))
+            if span_idx + 1 < len(spans):
+                ns, _ = spans[span_idx + 1]
+                next_indices = [j for j, m in enumerate(word_matches) if m.start() >= ns]
+                end_sec = (
+                    max(0.0, float(word_timings[next_indices[0]].get("start_sec", duration)))
+                    if next_indices else duration
+                )
+            else:
+                end_sec = duration
+            chunks.append({"text": span_text, "start_sec": start_sec, "end_sec": end_sec})
         return chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+
 
     @classmethod
     def _subtitle_vf(cls, narration: str, word_timings: list, duration: float, subtitle_dir: str, scene_idx: int) -> str:
@@ -926,6 +976,7 @@ class StoryboardTab(QWidget):
             "Gemini — Leda (Female)",
             "Google Cloud (Journey-D)",
         ])
+        self.tts_engine_combo.setCurrentText("Gemini — Kore (Female)")
         self.tts_engine_combo.setToolTip("Select the Text-to-Speech voice. Gemini voices are locked to a single gender per call.")
         
         self.generate_all_btn = QPushButton("⚡ Auto-Generate All Scenes")
@@ -1019,6 +1070,7 @@ class StoryboardTab(QWidget):
             gen_img_btn.setProperty("class", "primary-button")
             view_img_btn = QPushButton("👁️ View Image")
             view_img_btn.setProperty("class", "secondary-button")
+            view_img_btn.setFixedWidth(110)
             view_img_btn.hide()
             
             status_lbl_img = QLabel("")
@@ -1036,6 +1088,7 @@ class StoryboardTab(QWidget):
             gen_aud_btn.setProperty("class", "primary-button")
             play_aud_btn = QPushButton("▶️ Play Audio")
             play_aud_btn.setProperty("class", "secondary-button")
+            play_aud_btn.setFixedWidth(110)
             play_aud_btn.hide()
             
             status_lbl_aud = QLabel("")
@@ -1114,7 +1167,7 @@ class StoryboardTab(QWidget):
                 thread = AudioGenerationThread(text, out_path, engine, voice)
                 setattr(self, f"aud_thread_{idx}", thread)
                 
-                def on_finish(success, path):
+                def on_finish(success, path, err_msg):
                     btn.setEnabled(True)
                     if success:
                         lbl.setText(f"✅ Audio Saved.")
@@ -1127,7 +1180,7 @@ class StoryboardTab(QWidget):
                         play_btn.show()
                         play_btn.clicked.connect(lambda: os.startfile(os.path.abspath(path)) if os.name == 'nt' else None)
                     else:
-                        lbl.setText("❌ Audio Failed.")
+                        lbl.setText(f"❌ Audio Failed: {err_msg}" if err_msg else "❌ Audio Failed.")
                         lbl.setStyleSheet("color: #f38ba8;")
                         
                 thread.finished.connect(on_finish)
@@ -1323,6 +1376,7 @@ class ExportTab(QWidget):
         self.render_btn = QPushButton("🎬 Stitch Final Video")
         self.render_btn.setProperty("class", "success-button")
         self.render_btn.setMinimumHeight(44)
+        self.render_btn.setEnabled(False)
         self.render_btn.clicked.connect(self.start_stitch.emit)
         root.addWidget(self.render_btn)
 
@@ -1348,8 +1402,13 @@ class ExportTab(QWidget):
         self._spin_timer.timeout.connect(self._spin_tick)
 
     # ── Helpers ──────────────────────────────────────────────────────────
-    def populate_thumbnails(self, scenes):
+    def populate_thumbnails(self, scenes, video_path: str = ""):
         """Populate the horizontal thumbnail grid from scene img_paths."""
+        self.render_btn.setEnabled(bool(scenes))
+        if scenes and video_path and os.path.exists(video_path):
+            self.render_btn.setText("🔁 Re-Stitch Video")
+        elif scenes:
+            self.render_btn.setText("🎬 Stitch Final Video")
         # Clear old thumbs
         while self.thumb_layout.count() > 1:
             item = self.thumb_layout.takeAt(0)
@@ -1400,7 +1459,7 @@ class ExportTab(QWidget):
     def stop_render_ui(self, success: bool, msg: str):
         self._spin_timer.stop()
         self.render_btn.setEnabled(True)
-        self.render_btn.setText("🎬 Stitch Final Video")
+        self.render_btn.setText("🔁 Re-Stitch Video" if success else "🎬 Stitch Final Video")
         self.progress_bar.hide()
         self.pct_lbl.hide()
         if success:
@@ -1435,7 +1494,8 @@ class ExportTab(QWidget):
     def reset_ui(self):
         self.status_lbl.setText("Ready to stitch.")
         self.status_lbl.setStyleSheet("color: #cdd6f4;")
-        self.render_btn.setEnabled(True)
+        self.render_btn.setEnabled(False)
+        self.render_btn.setText("🎬 Stitch Final Video")
         self.progress_bar.hide()
         self.pct_lbl.hide()
         self.view_video_btn.hide()
@@ -1639,6 +1699,7 @@ class HistoryTab(QWidget):
             "Gemini — Leda (Female)",
             "Google Cloud (Journey-D)",
         ])
+        self.history_tts_engine_combo.setCurrentText("Gemini — Kore (Female)")
         self.history_tts_engine_combo.setToolTip("Select TTS voice for history scene audio generation.")
         self.history_generate_all_btn = QPushButton("⚡ Generate All")
         self.history_generate_all_btn.setProperty("class", "success-button")
@@ -1972,7 +2033,7 @@ class HistoryTab(QWidget):
                 thread = AudioGenerationThread(s.get('narration', ''), out_path, engine, voice)
                 setattr(self, f"history_aud_thread_{idx}", thread)
 
-                def on_finish(success, path):
+                def on_finish(success, path, err_msg):
                     btn.setEnabled(True)
                     if success:
                         status_lbl.setText("✅ Audio Saved.")
@@ -1990,7 +2051,7 @@ class HistoryTab(QWidget):
                             self._play_history_audio(p, scene_idx, lbl, None)
                         )
                     else:
-                        status_lbl.setText("❌ Audio Failed.")
+                        status_lbl.setText(f"❌ Audio Failed: {err_msg}" if err_msg else "❌ Audio Failed.")
                         status_lbl.setStyleSheet("color: #f38ba8;")
                     self._update_restitch_button_visibility()
 
@@ -2311,6 +2372,138 @@ class HistoryTab(QWidget):
             self.restitch_status.setStyleSheet("color:#f38ba8;")
 
 
+class ApiKeyDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Gemini API Key Required")
+        self.setFixedWidth(480)
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        title = QLabel("Welcome to Infographic Video Generator")
+        title.setProperty("class", "h2")
+        layout.addWidget(title)
+
+        info = QLabel(
+            "A Gemini API key is required to generate scripts, images, and audio.\n"
+            "Get your free key at: console.cloud.google.com or ai.google.dev"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        key_row = QHBoxLayout()
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Paste your Gemini API key here...")
+        self.key_input.setEchoMode(QLineEdit.Password)
+        key_row.addWidget(self.key_input)
+        self.show_btn = QPushButton("👁")
+        self.show_btn.setFixedWidth(36)
+        self.show_btn.setCheckable(True)
+        self.show_btn.toggled.connect(lambda checked: self.key_input.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password))
+        key_row.addWidget(self.show_btn)
+        layout.addLayout(key_row)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #f38ba8;")
+        layout.addWidget(self.status_lbl)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("Save & Continue")
+        save_btn.setProperty("class", "success-button")
+        save_btn.clicked.connect(self._save)
+        skip_btn = QPushButton("Skip for now")
+        skip_btn.setProperty("class", "secondary-button")
+        skip_btn.clicked.connect(self.reject)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(skip_btn)
+        layout.addLayout(btn_row)
+
+    def _save(self):
+        key = self.key_input.text().strip()
+        if not key:
+            self.status_lbl.setText("Please enter a valid API key.")
+            return
+        _save_env_key("GEMINI_API_KEY", key)
+        self.accept()
+
+
+class SettingsTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(32, 32, 32, 32)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignTop)
+
+        title = QLabel("Settings")
+        title.setProperty("class", "h2")
+        layout.addWidget(title)
+
+        # Gemini API Key
+        api_frame = QFrame()
+        api_frame.setProperty("class", "card")
+        api_layout = QVBoxLayout(api_frame)
+        api_layout.setSpacing(10)
+
+        api_title = QLabel("Gemini API Key")
+        api_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        api_layout.addWidget(api_title)
+
+        api_desc = QLabel("Used for script generation, image generation, and TTS audio.")
+        api_desc.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        api_layout.addWidget(api_desc)
+
+        key_row = QHBoxLayout()
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Enter Gemini API key...")
+        self.key_input.setEchoMode(QLineEdit.Password)
+        current_key = os.getenv("GEMINI_API_KEY", "")
+        if current_key and current_key != "your_gemini_api_key_here":
+            self.key_input.setText(current_key)
+        key_row.addWidget(self.key_input)
+
+        self.show_btn = QPushButton("👁 Show Key")
+        self.show_btn.setProperty("class", "secondary-button")
+        self.show_btn.setFixedWidth(130)
+        self.show_btn.setCheckable(True)
+        self.show_btn.toggled.connect(self._toggle_visibility)
+        key_row.addWidget(self.show_btn)
+        api_layout.addLayout(key_row)
+
+        save_row = QHBoxLayout()
+        self.save_btn = QPushButton("💾 Save API Key")
+        self.save_btn.setProperty("class", "success-button")
+        self.save_btn.setFixedWidth(160)
+        self.save_btn.clicked.connect(self._save_key)
+        self.status_lbl = QLabel("")
+        save_row.addWidget(self.save_btn)
+        save_row.addWidget(self.status_lbl)
+        save_row.addStretch()
+        api_layout.addLayout(save_row)
+
+        layout.addWidget(api_frame)
+        layout.addStretch()
+
+    def _toggle_visibility(self, checked: bool):
+        self.key_input.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        self.show_btn.setText("🙈 Hide Key" if checked else "👁 Show Key")
+
+    def _save_key(self):
+        key = self.key_input.text().strip()
+        if not key:
+            self.status_lbl.setText("⚠️ Key cannot be empty.")
+            self.status_lbl.setStyleSheet("color: #f38ba8;")
+            return
+        _save_env_key("GEMINI_API_KEY", key)
+        _load_env()
+        self.status_lbl.setText("✅ Saved successfully.")
+        self.status_lbl.setStyleSheet("color: #a6e3a1;")
+        QTimer.singleShot(3000, lambda: self.status_lbl.setText(""))
+
+
 class AppWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2326,11 +2519,13 @@ class AppWindow(QMainWindow):
         self.storyboard_tab = StoryboardTab()
         self.export_tab = ExportTab()
         self.history_tab = HistoryTab()
+        self.settings_tab = SettingsTab()
         
         self.tabs.addTab(self.script_tab, "✍️ Scripting")
         self.tabs.addTab(self.storyboard_tab, "🎨 Storyboard")
         self.tabs.addTab(self.export_tab, "🎬 Export Video")
         self.tabs.addTab(self.history_tab, "📚 History")
+        self.tabs.addTab(self.settings_tab, "⚙️ Settings")
         
         self.setCentralWidget(self.tabs)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -2350,14 +2545,22 @@ class AppWindow(QMainWindow):
         # Re-stitching from history
         self.history_tab.restitch_requested.connect(self.on_history_restitch)
 
+        self._APP_NAME = "Infographic Video Generator"
+
         # System tray for "done" notifications (works even when app is in background)
         self._tray = None
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = QSystemTrayIcon(self)
-            # Use the window icon or a blank pixmap as tray icon
             self._tray.setIcon(self.style().standardIcon(self.style().SP_ComputerIcon))
-            self._tray.setToolTip("Infographic Video Generator")
+            self._tray.setToolTip(self._APP_NAME)
             self._tray.show()
+
+    def _notify(self, title: str, body: str, icon=QSystemTrayIcon.Information, duration_ms: int = 5000, delay_ms: int = 800):
+        if not (hasattr(self, '_tray') and self._tray):
+            return
+        QTimer.singleShot(delay_ms, lambda: self._tray.showMessage(
+            f"{self._APP_NAME} — {title}", body, icon, duration_ms
+        ))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -2400,16 +2603,22 @@ class AppWindow(QMainWindow):
         except Exception:
             pass
 
+    def _current_video_path(self) -> str:
+        if not self.current_topic:
+            return ""
+        safe_topic = make_safe_topic(self.current_topic)
+        return os.path.join(os.path.dirname(__file__), 'assets', safe_topic, f"{safe_topic}.mp4")
+
     def on_script_next(self, scenes):
         self.current_scenes = scenes
         self.storyboard_tab.load_scenes(self.current_scenes, topic=self.current_topic)
         self.tabs.setCurrentIndex(1)
         self.export_tab.reset_ui()
-        self.export_tab.populate_thumbnails(self.current_scenes)
+        self.export_tab.populate_thumbnails(self.current_scenes, self._current_video_path())
 
     def _on_tab_changed(self, index: int):
         if self.tabs.widget(index) is self.export_tab and self.current_scenes:
-            self.export_tab.populate_thumbnails(self.current_scenes)
+            self.export_tab.populate_thumbnails(self.current_scenes, self._current_video_path())
         
     def start_stitching_process(self):
         # Strict upfront completeness check — collect every missing asset
@@ -2450,21 +2659,11 @@ class AppWindow(QMainWindow):
         self.export_tab.stop_render_ui(success, result_msg)
         
         # Desktop notification — works even if the user has switched tabs
-        if hasattr(self, '_tray') and self._tray:
-            if success:
-                self._tray.showMessage(
-                    "Video Ready! 🎬",
-                    f"{os.path.basename(result_msg)} has been saved.",
-                    QSystemTrayIcon.Information, 5000
-                )
-                # Refresh thumbnails with any newly generated images
-                self.export_tab.populate_thumbnails(self.current_scenes)
-            else:
-                self._tray.showMessage(
-                    "Stitching Failed ❌",
-                    result_msg[:120],
-                    QSystemTrayIcon.Critical, 5000
-                )
+        if success:
+            self._notify("Video Ready! 🎬", f"{os.path.basename(result_msg)} has been saved.")
+            self.export_tab.populate_thumbnails(self.current_scenes, self._current_video_path())
+        else:
+            self._notify("Stitching Failed ❌", result_msg[:120], QSystemTrayIcon.Critical)
 
     def on_history_restitch(self, scenes, topic):
         """Triggered by History tab Re-Stitch button — runs stitch in background, reports back inline."""
@@ -2485,21 +2684,14 @@ class AppWindow(QMainWindow):
         self._history_stitch_thread.finished.connect(self.on_history_restitch_done)
         self._history_stitch_thread.start()
 
-        if self._tray:
-            self._tray.showMessage("Re-Stitching Started ⏳",
-                f"Building video for “{topic}” in the background.",
-                QSystemTrayIcon.Information, 3000)
+        self._notify("Re-Stitching Started ⏳", f'Building video for "{topic}" in the background.', duration_ms=3000)
 
     def on_history_restitch_done(self, success, result_msg):
         self.history_tab.finish_restitch(success, result_msg)
-        if self._tray:
-            if success:
-                self._tray.showMessage("Re-Stitch Done! 🎬",
-                    f"{os.path.basename(result_msg)} saved.",
-                    QSystemTrayIcon.Information, 5000)
-            else:
-                self._tray.showMessage("Re-Stitch Failed ❌",
-                    result_msg[:120], QSystemTrayIcon.Critical, 5000)
+        if success:
+            self._notify("Re-Stitch Done! 🎬", f"{os.path.basename(result_msg)} saved.")
+        else:
+            self._notify("Re-Stitch Failed ❌", result_msg[:120], icon=QSystemTrayIcon.Critical)
 
 # --- MODERN DARK THEME QSS ---
 STYLESHEET = """
@@ -2652,10 +2844,17 @@ QPushButton[class="danger-button"]:disabled {
 """
 
 if __name__ == '__main__':
-    db.init_db() # Create tables if not strictly present
+    db.init_db()
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     window = AppWindow()
     window.show()
+
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not gemini_key or gemini_key == "your_gemini_api_key_here":
+        dlg = ApiKeyDialog(window)
+        dlg.exec_()
+        _load_env()
+
     sys.exit(app.exec_())
 
