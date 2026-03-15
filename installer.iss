@@ -1,10 +1,11 @@
 #define AppName      "Infographic Video Generator"
-#define AppVersion   "1.0.0"
+#define AppVersion   "1.1.0"
 #define AppPublisher "Your Name"
 #define AppURL       "https://yourwebsite.com"
 #define AppExeName   "VideoGeneratorAI.exe"
 #define AppIconFile  "app_icon.ico"
 #define DistDir      "dist\VideoGeneratorAI"
+#define AppDataDir   "{userappdata}\InfographicVideoGenerator"
 
 [Setup]
 AppId={{A3F2B841-7C44-4D9E-B123-9F1C2E3D4A5B}
@@ -38,8 +39,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
 [Files]
-Source: "{#DistDir}\*";           DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#DistDir}\_internal\app_icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}";           Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\app_icon.ico"
@@ -50,12 +50,29 @@ Name: "{commondesktop}\{#AppName}";   Filename: "{app}\{#AppExeName}"; IconFilen
 Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{app}\assets"
+; App install directory leftovers
 Type: filesandordirs; Name: "{app}\__pycache__"
-Type: files;          Name: "{app}\.env"
+; User data written to APPDATA by the running app
+Type: files;          Name: "{#AppDataDir}\.env"
+Type: files;          Name: "{#AppDataDir}\app.log"
+Type: files;          Name: "{#AppDataDir}\video_generator.db"
+Type: filesandordirs; Name: "{#AppDataDir}\assets"
 
 [Code]
 function InitializeSetup(): Boolean;
 begin
   Result := True;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  AppDataPath: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    AppDataPath := ExpandConstant('{#AppDataDir}');
+    // Remove the APPDATA folder only if it is empty after our targeted deletions above
+    if DirExists(AppDataPath) then
+      RemoveDir(AppDataPath);
+  end;
 end;

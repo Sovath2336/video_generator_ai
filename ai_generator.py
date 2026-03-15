@@ -1,10 +1,12 @@
 import base64
 import json
+import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import wave
 from difflib import SequenceMatcher
@@ -28,6 +30,37 @@ def _ai_app_data_dir() -> str:
 # Load .env from the writable user-data location
 _env_path = os.path.join(_ai_app_data_dir(), '.env')
 load_dotenv(_env_path, override=True)
+
+# File-based logger — works in frozen EXE where stdout is invisible
+def _setup_logger() -> logging.Logger:
+    _log = logging.getLogger("video_generator_ai")
+    if _log.handlers:
+        return _log
+    _log.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+    _log_path = os.path.join(_ai_app_data_dir(), "app.log")
+    fh = logging.FileHandler(_log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    _log.addHandler(fh)
+    # Mirror all messages to the terminal so the dev can see live activity
+    if not getattr(sys, 'frozen', False):
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        _log.addHandler(sh)
+    return _log
+
+logger = _setup_logger()
+
+# Thread-safe genai.Client cache — avoids creating a new HTTP connection pool on every call.
+# genai.Client is stateless (no session tokens), so sharing across threads is safe.
+_genai_client_cache: dict[str, genai.Client] = {}
+_genai_client_lock = threading.Lock()
+
+def _get_genai_client(api_key: str) -> genai.Client:
+    with _genai_client_lock:
+        if api_key not in _genai_client_cache:
+            _genai_client_cache[api_key] = genai.Client(api_key=api_key)
+        return _genai_client_cache[api_key]
 
 # Resolve ffmpeg — in a frozen EXE use a writable temp alias dir
 _ffmpeg_exe = None
@@ -73,6 +106,36 @@ try:
 except Exception:
     pass
 
+def correct_topic_title(topic: str) -> str:
+    """
+    Uses Gemini Flash to fix typos, grammar, and capitalization in a user-entered topic title.
+    Returns the corrected title, or the original string if correction fails for any reason.
+    Fast (~1s) because it uses a lightweight model with a tiny prompt.
+    """
+    if not topic or not topic.strip():
+        return topic
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key or api_key == "your_gemini_api_key_here":
+        return topic
+    try:
+        client = _get_genai_client(api_key)
+        result = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=(
+                "Fix any spelling mistakes, grammar errors, and capitalization in this video topic title. "
+                "Return ONLY the corrected title — no quotes, no explanation, no punctuation at the end.\n\n"
+                f"Topic: {topic}"
+            ),
+        )
+        corrected = (result.text or "").strip().strip('"').strip("'").strip()
+        if corrected:
+            logger.info("Topic corrected: %r -> %r", topic, corrected)
+            return corrected
+    except Exception as e:
+        logger.warning("correct_topic_title failed (using original): %s", e)
+    return topic
+
+
 def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_search: bool = False):
     """
     Uses Gemini 2.5 Pro to generate a structured infographic script from a user-provided topic.
@@ -80,17 +143,22 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
     fetches live, up-to-date web results before writing the script.
     Yields the response in chunks for streaming.
     """
+    logger.info("generate_script_from_topic: topic=%r, duration=%dm, web_search=%s",
+                topic, duration_minutes, use_web_search)
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == 'your_gemini_api_key_here':
+        logger.error("generate_script_from_topic: GEMINI_API_KEY not set.")
         yield "[Error]: A valid GEMINI_API_KEY was not found in the .env file. Please add your API key."
         return
 
     try:
         client = genai.Client(api_key=api_key)
-        
+
         estimated_scenes_min = max(6, int(duration_minutes * 1.5) + 1)
         estimated_scenes_max = max(8, int(duration_minutes * 2) + 2)
         words_per_scene = int((duration_minutes * 140) / ((estimated_scenes_min + estimated_scenes_max) / 2))
+        logger.info("Script plan: %d-%d scenes, ~%d words/scene",
+                    estimated_scenes_min, estimated_scenes_max, words_per_scene)
 
         web_note = (
             "You have access to Google Search. Before writing, SEARCH the web for the most "
@@ -156,10 +224,15 @@ CRITICAL:
         # Build generation config — add Google Search tool if requested
         config = None
         if use_web_search:
+            logger.info("Web search grounding: ON — Gemini will query Google Search before writing.")
             config = genai_types.GenerateContentConfig(
                 tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
             )
+        else:
+            logger.info("Web search grounding: OFF — using Gemini knowledge only.")
 
+        logger.info("Calling gemini-2.5-pro (streaming)...")
+        chunk_count = 0
         response = client.models.generate_content_stream(
             model='gemini-2.5-pro',
             contents=prompt,
@@ -167,8 +240,11 @@ CRITICAL:
         )
         for chunk in response:
             if chunk.text:
+                chunk_count += 1
                 yield chunk.text
+        logger.info("Script stream complete (%d chunks received).", chunk_count)
     except Exception as e:
+        logger.exception("generate_script_from_topic failed: %s", e)
         yield f"[Error occurred during Gemini 2.5 generation]:\n{str(e)}"
 
 def analyze_text_to_scenes(source_text: str):
@@ -177,8 +253,10 @@ def analyze_text_to_scenes(source_text: str):
     Gemini 2.5 Pro to intelligently split it into infographic video scenes.
     Yields the response in chunks for streaming.
     """
+    logger.info("analyze_text_to_scenes: source_text length=%d chars", len(source_text))
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == 'your_gemini_api_key_here':
+        logger.error("analyze_text_to_scenes: GEMINI_API_KEY not set.")
         yield "[Error]: A valid GEMINI_API_KEY was not found in the .env file."
         return
 
@@ -236,14 +314,19 @@ Scene 1 must be a separate title-card intro, and the first real content narratio
 The subscribe/call-to-action must appear only in the final brief outro scene, never inside the main content scenes.
 """
 
+        logger.info("Calling gemini-2.5-pro for text-to-scenes (streaming)...")
+        chunk_count = 0
         response = client.models.generate_content_stream(
             model='gemini-2.5-pro',
             contents=prompt,
         )
         for chunk in response:
             if chunk.text:
+                chunk_count += 1
                 yield chunk.text
+        logger.info("Text-to-scenes stream complete (%d chunks received).", chunk_count)
     except Exception as e:
+        logger.exception("analyze_text_to_scenes failed: %s", e)
         yield f"[Error during text analysis]:\n{str(e)}"
 
 def _is_cta_image_prompt(prompt: str) -> bool:
@@ -313,6 +396,8 @@ def _build_image_prompt(prompt: str, image_text: str | None = None, narration: s
     )
 
 
+_VALID_IMAGE_SIZES = {"512", "1K", "2K", "4K"}
+
 def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str | None = None, narration: str | None = None) -> bool:
     """
     Uses Imagen 3 via the Gemini API to generate an image and save it to output_path.
@@ -320,50 +405,99 @@ def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str 
     `narration` is used to anchor the image to the scene's core idea.
     Returns True if successful, False otherwise.
     """
+    scene_label = os.path.basename(output_path)
     if _is_cta_image_prompt(prompt):
         shared_cta_path = _shared_cta_image_path()
         try:
             if os.path.exists(shared_cta_path) and os.path.getsize(shared_cta_path) > 0:
+                logger.info("[%s] CTA image: reusing cached outro image.", scene_label)
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
                 shutil.copy2(shared_cta_path, output_path)
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("CTA cache copy failed (will regenerate): %s", e)
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == 'your_gemini_api_key_here':
+        logger.warning("generate_image_from_prompt: GEMINI_API_KEY not set, skipping.")
         return False
-        
-    try:
-        client = genai.Client(api_key=api_key)
-        result = client.models.generate_content(
-            model='gemini-3.1-flash-image-preview',
-            contents=_build_image_prompt(prompt, overlay_text, narration),
-            config=genai_types.GenerateContentConfig(
-                response_modalities=['TEXT', 'IMAGE'],
-                image_config=genai_types.ImageConfig(
-                    aspect_ratio='16:9',
-                    image_size=os.getenv("IMAGE_RESOLUTION", "1K"),
-                ),
-            ),
+
+    # Validate IMAGE_RESOLUTION — strip whitespace and normalize case
+    raw_res = os.getenv("IMAGE_RESOLUTION", "1K").strip().upper()
+    if raw_res not in _VALID_IMAGE_SIZES:
+        logger.error(
+            "IMAGE_RESOLUTION '%s' is invalid (must be one of %s). Falling back to '1K'.",
+            raw_res, sorted(_VALID_IMAGE_SIZES),
         )
+        raw_res = "1K"
+    # The API accepts "1K"/"2K"/"4K" in uppercase and "512" as-is
+    image_size = raw_res
+
+    logger.info("[%s] Generating image — size=%s, prompt=%r...", scene_label, image_size, prompt[:60])
+    try:
+        client = _get_genai_client(api_key)
+        result = None
+        for _attempt in range(4):
+            try:
+                result = client.models.generate_content(
+                    model='gemini-3.1-flash-image-preview',
+                    contents=_build_image_prompt(prompt, overlay_text, narration),
+                    config=genai_types.GenerateContentConfig(
+                        response_modalities=['TEXT', 'IMAGE'],
+                        image_config=genai_types.ImageConfig(
+                            aspect_ratio='16:9',
+                            image_size=image_size,
+                        ),
+                    ),
+                )
+                break
+            except Exception as _e:
+                _msg = str(_e)
+                if ("429" in _msg or "RESOURCE_EXHAUSTED" in _msg or "quota" in _msg.lower()) and _attempt < 3:
+                    _wait = 2 ** _attempt
+                    logger.warning("[%s] Image rate limited (attempt %d/4), retrying in %ds...",
+                                   scene_label, _attempt + 1, _wait)
+                    time.sleep(_wait)
+                    continue
+                raise
+        if result is None:
+            logger.error("[%s] Image generation exhausted all retries.", scene_label)
+            return False
         # Returns images inline in parts[].inline_data (TEXT+IMAGE modalities may both appear)
         if result.candidates and result.candidates[0].content.parts:
             for part in result.candidates[0].content.parts:
                 if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
+                    byte_size = len(part.inline_data.data)
                     os.makedirs(os.path.dirname(output_path), exist_ok=True)
                     with open(output_path, "wb") as f:
                         f.write(part.inline_data.data)
+                    logger.info("[%s] Image saved — %d bytes -> %s", scene_label, byte_size, output_path)
                     if _is_cta_image_prompt(prompt):
                         try:
                             shutil.copy2(output_path, _shared_cta_image_path())
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning("CTA cache save failed: %s", e)
                     return True
-            
+            # API responded but contained no image data — log what we actually got
+            parts_summary = [
+                f"part[{i}]: inline_data={'yes' if (hasattr(p, 'inline_data') and p.inline_data) else 'no'}, text={repr(getattr(p, 'text', None))[:80] if hasattr(p, 'text') else 'n/a'}"
+                for i, p in enumerate(result.candidates[0].content.parts)
+            ]
+            finish_reason = getattr(result.candidates[0], 'finish_reason', 'unknown')
+            logger.error(
+                "Image API returned no inline image data. finish_reason=%s, parts=[%s]",
+                finish_reason, "; ".join(parts_summary),
+            )
+        else:
+            finish_reason = getattr(result.candidates[0], 'finish_reason', 'unknown') if result.candidates else 'no_candidates'
+            logger.error(
+                "Image API returned empty candidates/parts. finish_reason=%s", finish_reason,
+            )
+
     except Exception as e:
-        print(f"Image Gen Error: {e}")
-        
+        logger.exception("generate_image_from_prompt failed (prompt=%r, size=%s): %s", prompt[:80], image_size, e)
+
+    logger.warning("[%s] Image generation FAILED.", scene_label)
     return False
 
 
@@ -602,17 +736,21 @@ def _save_gemini_audio_bytes(audio_bytes: bytes, mime_type: str, output_path: st
 
 def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini", voice: str | None = None) -> bool:
     import traceback as _tb
+    scene_label = os.path.basename(output_path)
     try:
         if engine == "gemini":
             api_key = os.getenv("GEMINI_API_KEY")
             if not api_key or api_key == 'your_gemini_api_key_here':
+                logger.warning("[%s] Audio: GEMINI_API_KEY not set, skipping.", scene_label)
                 return False
 
             try:
                 import time as _time
-                client = genai.Client(api_key=api_key)
+                client = _get_genai_client(api_key)
                 tts_model = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
                 tts_voice = voice or os.getenv("GEMINI_TTS_VOICE", "puck")
+                logger.info("[%s] Generating audio — model=%s, voice=%s, text_len=%d chars",
+                            scene_label, tts_model, tts_voice, len(text))
 
                 response = None
                 for _attempt in range(4):
@@ -638,7 +776,8 @@ def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini"
                         if "500" in _msg or "503" in _msg or "INTERNAL" in _msg or "UNAVAILABLE" in _msg:
                             if _attempt < 3:
                                 _wait = 2 ** _attempt
-                                print(f"[Gemini TTS] Server error (attempt {_attempt+1}), retrying in {_wait}s...")
+                                logger.warning("[%s] TTS server error (attempt %d), retrying in %ds...",
+                                               scene_label, _attempt + 1, _wait)
                                 _time.sleep(_wait)
                                 continue
                         raise
@@ -646,18 +785,26 @@ def generate_audio_from_text(text: str, output_path: str, engine: str = "gemini"
                 if response and response.candidates and response.candidates[0].content.parts:
                     for part in response.candidates[0].content.parts:
                         if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
-                            return _save_gemini_audio_bytes(
+                            byte_size = len(part.inline_data.data)
+                            result = _save_gemini_audio_bytes(
                                 part.inline_data.data,
                                 getattr(part.inline_data, "mime_type", ""),
                                 output_path,
                             )
+                            if result:
+                                logger.info("[%s] Audio saved — %d bytes -> %s", scene_label, byte_size, output_path)
+                            else:
+                                logger.warning("[%s] Audio save returned False.", scene_label)
+                            return result
+                logger.warning("[%s] Audio: API returned no audio data.", scene_label)
                 return False
             except Exception as e:
-                print(f"[Gemini TTS] Error:\n{_tb.format_exc()}")
+                logger.exception("[%s] Gemini TTS error: %s", scene_label, e)
                 return False
     except Exception as e:
-        print(f"[Audio Gen] Unexpected error:\n{_tb.format_exc()}")
+        logger.exception("[%s] Audio generation unexpected error: %s", scene_label, e)
 
+    logger.warning("[%s] Audio generation FAILED.", scene_label)
     return False
 
 def generate_and_mix_audio(

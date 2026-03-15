@@ -36,11 +36,13 @@ from PyQt5.QtGui import QPixmap, QIcon
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QUrl
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from ai_generator import (
+    correct_topic_title,
     generate_script_from_topic,
     analyze_text_to_scenes,
     generate_image_from_prompt,
     generate_audio_from_text,
     ensure_word_timing_data,
+    logger,
 )
 import db
 import moviepy.editor as mp
@@ -190,12 +192,14 @@ class AudioGenerationThread(QThread):
             success = generate_audio_from_text(self.text, self.output_path, self.engine, self.voice)
             self.generation_done.emit(success, self.output_path, "" if success else "generate_audio_from_text returned False")
         except Exception as e:
-            print(f"AudioGenerationThread error:\n{_tb.format_exc()}")
+            logger.exception("AudioGenerationThread error: %s", e)
             self.generation_done.emit(False, self.output_path, str(e))
+
+_BULK_WORKERS = 3  # Max concurrent scene workers. Keep ≤3 to stay within Gemini free-tier rate limits.
 
 class BulkGenerationThread(QThread):
     """
-    Processes ALL scenes sequentially: image then audio for each scene, in order.
+    Processes scenes concurrently (up to _BULK_WORKERS at a time): image then audio per scene.
     Saves all assets into assets/{topic_folder}/scene_X.{ext}
     """
     scene_progress = pyqtSignal(int, str, str)
@@ -217,19 +221,27 @@ class BulkGenerationThread(QThread):
         try:
             self._run_inner()
         except BaseException as e:
+            logger.exception("BulkGenerationThread unhandled error: %s", e)
             self.all_done.emit(False, f"Generation error: {type(e).__name__}: {e}")
 
     def _run_inner(self):
+        import threading as _threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         os.makedirs(self.topic_folder, exist_ok=True)
 
         total = len(self.scenes)
+        workers = min(_BULK_WORKERS, total)
         failed = []
-        img_done = 0
-        aud_done = 0
+        lock = _threading.Lock()
+        counters = {'img': 0, 'aud': 0}
 
-        for i, scene in enumerate(self.scenes):
+        logger.info("BulkGeneration started: %d scenes, workers=%d, engine=%s, voice=%s, skip_existing=%s",
+                    total, workers, self.tts_engine, self.tts_voice, self.skip_existing)
+
+        def process_scene(i, scene):
+            # Each worker handles one scene: image first, then audio (sequential within the scene).
             if self.is_cancelled:
-                self.all_done.emit(False, "Generation was stopped by the user.")
                 return
 
             idx = i + 1
@@ -253,12 +265,15 @@ class BulkGenerationThread(QThread):
             skip_img = self.skip_existing and img_exists
             skip_aud = self.skip_existing and aud_exists
 
+            logger.info("--- Scene %d/%d (worker) ---", idx, total)
+
             # --- Image ---
             if skip_img:
                 scene['img_path'] = img_path if os.path.exists(img_path) else existing_img
+                logger.info("Scene %d: image skipped (already exists).", idx)
                 self.scene_progress.emit(i, 'img', '⏭️ Image skipped (exists)')
             else:
-                self.scene_progress.emit(i, 'img', f'⏳ Generating image {img_done+1}/{total}...')
+                self.scene_progress.emit(i, 'img', '⏳ Generating image...')
                 try:
                     img_ok = generate_image_from_prompt(
                         scene.get('visual', ''),
@@ -267,18 +282,27 @@ class BulkGenerationThread(QThread):
                         scene.get('narration', ''),
                     )
                 except BaseException as e:
+                    logger.exception("Scene %d image generation raised: %s", idx, e)
                     img_ok = False
                 if img_ok:
-                    img_done += 1
+                    with lock:
+                        counters['img'] += 1
+                        done = counters['img']
                     scene['img_path'] = img_path
+                    logger.info("Scene %d: image OK (%d/%d done).", idx, done, total)
                     try:
                         db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
                     except Exception:
                         pass
-                    self.scene_progress.emit(i, 'img', f'✅ Image done ({img_done}/{total})')
+                    self.scene_progress.emit(i, 'img', f'✅ Image done ({done}/{total})')
                 else:
-                    failed.append(f"Scene {idx} Image")
+                    logger.warning("Scene %d: image FAILED.", idx)
+                    with lock:
+                        failed.append(f"Scene {idx} Image")
                     self.scene_progress.emit(i, 'img', '❌ Image failed')
+
+            if self.is_cancelled:
+                return
 
             # --- Audio ---
             if skip_aud:
@@ -288,29 +312,62 @@ class BulkGenerationThread(QThread):
                     scene['audio_path'] = alt_aud_path
                 else:
                     scene['audio_path'] = existing_aud
+                logger.info("Scene %d: audio skipped (already exists).", idx)
                 self.scene_progress.emit(i, 'aud', '⏭️ Audio skipped (exists)')
             else:
-                self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {aud_done+1}/{total}...')
+                self.scene_progress.emit(i, 'aud', '⏳ Generating audio...')
                 try:
-                    aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path, self.tts_engine, self.tts_voice)
+                    aud_ok = generate_audio_from_text(
+                        scene.get('narration', ''), aud_path, self.tts_engine, self.tts_voice
+                    )
                 except BaseException as e:
+                    logger.exception("Scene %d audio generation raised: %s", idx, e)
                     aud_ok = False
                 if aud_ok:
-                    aud_done += 1
+                    with lock:
+                        counters['aud'] += 1
+                        done = counters['aud']
                     scene['audio_path'] = aud_path
+                    logger.info("Scene %d: audio OK (%d/%d done).", idx, done, total)
                     try:
                         db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
                         db.update_scene_asset(scene.get('db_id'), 'tts_voice', self.tts_voice or '')
                     except Exception:
                         pass
-                    self.scene_progress.emit(i, 'aud', f'✅ Audio done ({aud_done}/{total})')
+                    self.scene_progress.emit(i, 'aud', f'✅ Audio done ({done}/{total})')
                 else:
-                    failed.append(f"Scene {idx} Audio")
+                    logger.warning("Scene %d: audio FAILED.", idx)
+                    with lock:
+                        failed.append(f"Scene {idx} Audio")
                     self.scene_progress.emit(i, 'aud', '❌ Audio failed')
 
-        if failed:
+        # Submit all scenes to the thread pool. Workers are capped at _BULK_WORKERS so at most
+        # that many scenes run simultaneously. Each worker does image → audio in sequence,
+        # keeping peak concurrent API calls at _BULK_WORKERS (not 2×).
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for i, scene in enumerate(self.scenes):
+                if self.is_cancelled:
+                    break
+                futures[executor.submit(process_scene, i, scene)] = i
+
+            for future in as_completed(futures):
+                if self.is_cancelled:
+                    break
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.exception("Scene %d worker raised unexpected error: %s",
+                                     futures[future] + 1, e)
+        # executor.__exit__ waits for any still-running workers to finish naturally.
+
+        if self.is_cancelled:
+            self.all_done.emit(False, "Generation was stopped by the user.")
+        elif failed:
+            logger.warning("BulkGeneration finished with %d failure(s): %s", len(failed), failed)
             self.all_done.emit(False, f"Completed with failures: {', '.join(failed)}")
         else:
+            logger.info("BulkGeneration complete: all %d scenes generated successfully.", total)
             self.all_done.emit(True, f"All {total} scenes generated successfully!")
 
 class VideoStitchingThread(QThread):
@@ -739,8 +796,8 @@ class VideoStitchingThread(QThread):
                 "-i", aud_path,
                 "-vf", vf_scene,
                 "-af", af_scene,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "192k", "-ar", str(self.SAMPLE_RATE),
+                "-c:v", "libx264", "-preset", "fast", "-tune", "stillimage", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k", "-ar", str(self.SAMPLE_RATE),
                 "-t", f"{total_dur:.4f}",
                 "-pix_fmt", "yuv420p",
                 "-threads", threads,
@@ -807,6 +864,19 @@ class AnalyzeTextThread(QThread):
             self.chunk_received.emit(chunk)
         self.finished.emit()
 
+class TopicCorrectionThread(QThread):
+    """Runs correct_topic_title() off the GUI thread so the UI stays responsive."""
+    correction_done = pyqtSignal(str)  # emits corrected title (or original on failure)
+
+    def __init__(self, topic: str):
+        super().__init__()
+        self.topic = topic
+
+    def run(self):
+        corrected = correct_topic_title(self.topic)
+        self.correction_done.emit(corrected)
+
+
 class ScriptTab(QWidget):
     next_requested = pyqtSignal(list)
     next_requested_topic = pyqtSignal(str)
@@ -863,6 +933,7 @@ class ScriptTab(QWidget):
         analyze_frame_layout.addLayout(analyze_header)
 
         self.analyze_input = QTextEdit()
+        self.analyze_input.setAcceptRichText(False)
         self.analyze_input.setPlaceholderText(
             "Paste any text here (article, blog post, notes, essay...)\n"
             "AI will analyze it and extract scenes with visual prompts and narration."
@@ -889,6 +960,7 @@ class ScriptTab(QWidget):
         layout.addWidget(lbl)
         
         self.script_editor = QTextEdit()
+        self.script_editor.setAcceptRichText(False)
         self.script_editor.setPlaceholderText("Enter the infographic script. Break it down into logical scenes.\\nExample:\\n[Scene 1]\\nVisual: A sun shining on a leaf.\\nNarration: Photosynthesis starts here.")
         layout.addWidget(self.script_editor)
         
@@ -956,19 +1028,34 @@ class ScriptTab(QWidget):
     def generate_script(self):
         topic = self.topic_input.text().strip()
         duration = self.duration_spin.value()
-        
+
         if not topic:
             QMessageBox.warning(self, "Input Error", "Please enter a topic first.")
             return
-        
+
         self.generate_btn.setEnabled(False)
-        self.generate_btn.setText("⏳ Generating...")
-        if self.web_search_chk.isChecked():
-            self.generate_btn.setText("🌐 Searching & Generating...")
-        
+        self.generate_btn.setText("✏️ Correcting topic...")
         self.script_editor.clear()
+
+        # Step 1: correct the topic title via Gemini, then kick off script generation.
+        self._correction_thread = TopicCorrectionThread(topic)
+        self._correction_thread.correction_done.connect(self._on_topic_corrected)
+        self._correction_thread.start()
+
+    def _on_topic_corrected(self, corrected_topic: str):
+        # Update the input field with the corrected title so the user can see it.
+        self.topic_input.setText(corrected_topic)
+
+        duration = self.duration_spin.value()
         use_web = self.web_search_chk.isChecked()
-        self.thread = ScriptGenerationThread(topic, duration, use_web)
+
+        if use_web:
+            self.generate_btn.setText("🌐 Searching & Generating...")
+        else:
+            self.generate_btn.setText("⏳ Generating...")
+
+        # Step 2: generate the script with the corrected topic.
+        self.thread = ScriptGenerationThread(corrected_topic, duration, use_web)
         self.thread.chunk_received.connect(self.on_chunk_received)
         self.thread.finished.connect(self.on_script_generated)
         self.thread.start()
@@ -1119,28 +1206,26 @@ class StoryboardTab(QWidget):
             # Action Buttons & Status (Images)
             btn_layout_img = QHBoxLayout()
             gen_img_btn = QPushButton("🖼️ Generate Image")
-            gen_img_btn.setProperty("class", "primary-button")
-            view_img_btn = QPushButton("👁  View Image")
-            view_img_btn.setProperty("class", "secondary-button")
-            view_img_btn.setFixedWidth(140)
+            gen_img_btn.setProperty("class", "scene-button")
+            view_img_btn = QPushButton("👁 View Image")
+            view_img_btn.setProperty("class", "scene-button")
             view_img_btn.hide()
-            
+
             status_lbl_img = QLabel("")
             status_lbl_img.setStyleSheet("color: #a6e3a1;")
-            
+
             btn_layout_img.addWidget(gen_img_btn)
             btn_layout_img.addWidget(view_img_btn)
             btn_layout_img.addWidget(status_lbl_img)
             btn_layout_img.addStretch()
             left_layout.addLayout(btn_layout_img)
-            
+
             # Action Buttons & Status (Audio)
             btn_layout_aud = QHBoxLayout()
             gen_aud_btn = QPushButton("🎙️ Generate Audio")
-            gen_aud_btn.setProperty("class", "primary-button")
-            play_aud_btn = QPushButton("▶  Play Audio")
-            play_aud_btn.setProperty("class", "secondary-button")
-            play_aud_btn.setFixedWidth(140)
+            gen_aud_btn.setProperty("class", "scene-button")
+            play_aud_btn = QPushButton("▶ Play Audio")
+            play_aud_btn.setProperty("class", "scene-button")
             play_aud_btn.hide()
             
             status_lbl_aud = QLabel("")
@@ -1328,15 +1413,13 @@ class StoryboardTab(QWidget):
                 pct = min(100, max(0, int(round(completed_steps / total_steps * 100))))
                 self.generate_all_btn.setText(f"⏳ Generating... {pct}%")
                 lbl_img, lbl_aud, p_lbl, v_btn, pl_btn = status_map[idx]
+                is_done        = 'done'       in msg_l or 'skipped' in msg_l
+                is_in_progress = 'generating' in msg_l
                 try:
                     if asset_type == 'img':
                         lbl_img.setText(msg)
-                        lbl_img.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
-                        if '⏳' in msg:
-                            self._start_spin(lbl_img, msg)
-                        else:
-                            self._stop_spin(lbl_img)
-                        if '✅' in msg:
+                        lbl_img.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                        if is_done:
                             path = scenes[idx].get('img_path', '')
                             if path and os.path.exists(path):
                                 pix = QPixmap(path)
@@ -1345,12 +1428,8 @@ class StoryboardTab(QWidget):
                                 v_btn.clicked.connect(lambda _, p=path: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
                     else:
                         lbl_aud.setText(msg)
-                        lbl_aud.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
-                        if '⏳' in msg:
-                            self._start_spin(lbl_aud, msg)
-                        else:
-                            self._stop_spin(lbl_aud)
-                        if '✅' in msg:
+                        lbl_aud.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                        if is_done:
                             path = scenes[idx].get('audio_path', '')
                             if path:
                                 pl_btn.show()
@@ -1367,8 +1446,8 @@ class StoryboardTab(QWidget):
                 else:
                     QMessageBox.warning(self, "Generation Issues/Stopped", msg)
 
-            bulk_thread.scene_progress.connect(on_scene_progress)
-            bulk_thread.all_done.connect(on_all_done)
+            bulk_thread.scene_progress.connect(on_scene_progress, Qt.QueuedConnection)
+            bulk_thread.all_done.connect(on_all_done, Qt.QueuedConnection)
             bulk_thread.start()
 
         self.generate_all_btn.clicked.connect(trigger_all)
@@ -2000,10 +2079,9 @@ class HistoryTab(QWidget):
 
             img_row = QHBoxLayout()
             gen_img_btn = QPushButton("🖼️ Generate Image")
-            gen_img_btn.setProperty("class", "primary-button")
-            view_img_btn = QPushButton("👁  View Image")
-            view_img_btn.setProperty("class", "secondary-button")
-            view_img_btn.setFixedWidth(140)
+            gen_img_btn.setProperty("class", "scene-button")
+            view_img_btn = QPushButton("👁 View Image")
+            view_img_btn.setProperty("class", "scene-button")
             view_img_btn.hide()
             img_status = QLabel("")
             img_status.setStyleSheet("color: #a6e3a1;")
@@ -2015,10 +2093,9 @@ class HistoryTab(QWidget):
 
             aud_row = QHBoxLayout()
             gen_aud_btn = QPushButton("🎙️ Generate Audio")
-            gen_aud_btn.setProperty("class", "primary-button")
-            play_aud_btn = QPushButton("▶  Play Audio")
-            play_aud_btn.setProperty("class", "secondary-button")
-            play_aud_btn.setFixedWidth(140)
+            gen_aud_btn.setProperty("class", "scene-button")
+            play_aud_btn = QPushButton("▶ Play Audio")
+            play_aud_btn.setProperty("class", "scene-button")
             play_aud_btn.hide()
             aud_status = QLabel("")
             aud_status.setStyleSheet("color: #a6e3a1;")
@@ -2269,8 +2346,8 @@ class HistoryTab(QWidget):
             if not all_ok:
                 QMessageBox.warning(self, "Generation Issues/Stopped", msg)
 
-        self._history_bulk_thread.scene_progress.connect(on_scene_progress)
-        self._history_bulk_thread.all_done.connect(on_all_done)
+        self._history_bulk_thread.scene_progress.connect(on_scene_progress, Qt.QueuedConnection)
+        self._history_bulk_thread.all_done.connect(on_all_done, Qt.QueuedConnection)
         self._history_bulk_thread.start()
 
     def _play_video(self):
@@ -2623,7 +2700,7 @@ class SettingsTab(QWidget):
         res_lbl = QLabel("Resolution:")
         self.res_combo = QComboBox()
         self.res_combo.addItems(["512 (fastest)", "1K (default)", "2K", "4K (best quality)"])
-        saved_res = os.getenv("IMAGE_RESOLUTION", "1K")
+        saved_res = os.getenv("IMAGE_RESOLUTION", "1K").strip().upper()
         res_map = {"512": 0, "1K": 1, "2K": 2, "4K": 3}
         self.res_combo.setCurrentIndex(res_map.get(saved_res, 1))
         res_row.addWidget(res_lbl)
@@ -3224,10 +3301,38 @@ QPushButton[class="danger-button"]:disabled {
     background-color: #7f1d1d;
     color: #fca5a5;
 }
+
+/* Compact buttons used inside scene cards */
+QPushButton[class="scene-button"] {
+    background-color: #313244;
+    color: #cdd6f4;
+    font-weight: bold;
+    padding: 6px 8px;
+}
+QPushButton[class="scene-button"]:hover {
+    background-color: #45475a;
+    color: #ffffff;
+}
+QPushButton[class="scene-button"]:pressed {
+    background-color: #585b70;
+}
+QPushButton[class="scene-button"]:disabled {
+    background-color: #232436;
+    color: #585b70;
+}
 """
 
 if __name__ == '__main__':
+    logger.info("=" * 60)
+    logger.info("AI Video Generator starting up")
+    logger.info("Log file: %s", logger.handlers[0].baseFilename)
+    logger.info("=" * 60)
+
+    logger.info("Initialising database...")
     db.init_db()
+    logger.info("Database ready.")
+
+    logger.info("Launching Qt application...")
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     _app_icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
@@ -3235,14 +3340,20 @@ if __name__ == '__main__':
         app.setWindowIcon(QIcon(_app_icon_path))
     window = AppWindow()
     window.show()
+    logger.info("Window shown. App is ready.")
 
     def _check_api_key():
         gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not gemini_key or gemini_key == "your_gemini_api_key_here":
+            logger.warning("GEMINI_API_KEY not set — showing API key dialog.")
             dlg = ApiKeyDialog(window)
             dlg.exec_()
             _load_env()
+        else:
+            logger.info("GEMINI_API_KEY detected (key length=%d).", len(gemini_key))
 
     QTimer.singleShot(300, _check_api_key)
-    sys.exit(app.exec_())
+    exit_code = app.exec_()
+    logger.info("App exited with code %d.", exit_code)
+    sys.exit(exit_code)
 

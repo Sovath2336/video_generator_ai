@@ -8,16 +8,18 @@ block_cipher = None
 project_dir = os.path.abspath(os.path.dirname(SPEC))
 
 added_files = [
-    (os.path.join(project_dir, 'db.py'),              '.'),
-    (os.path.join(project_dir, 'ai_generator.py'),    '.'),
-    (os.path.join(project_dir, '.ffmpeg_bin', 'ffmpeg.exe'), '.ffmpeg_bin'),
-    (os.path.join(project_dir, 'app_icon.ico'),       '.'),
-    (os.path.join(project_dir, '.env'),                '.'),
+    (os.path.join(project_dir, 'db.py'),           '.'),
+    (os.path.join(project_dir, 'ai_generator.py'), '.'),
+    (os.path.join(project_dir, 'app_icon.ico'),    '.'),
+    (os.path.join(project_dir, '.env'),             '.'),
 ]
 
 hidden_imports = [
     'PyQt5.QtMultimedia',
+    'PyQt5.QtMultimediaWidgets',
     'PyQt5.sip',
+    'concurrent.futures',
+    'threading',
     'google.genai',
     'google.api_core',
     'google.auth',
