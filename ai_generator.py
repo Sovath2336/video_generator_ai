@@ -52,6 +52,18 @@ except Exception:
     _ffmpeg_exe = None
 
 from pydub import AudioSegment
+import pydub.utils as _pydub_utils
+
+# Suppress console window for pydub's ffmpeg subprocesses on Windows
+if os.name == "nt":
+    import subprocess as _subprocess
+    _orig_pydub_Popen = _subprocess.Popen
+    def _silent_Popen(*args, **kwargs):
+        kwargs.setdefault("creationflags", 0)
+        kwargs["creationflags"] |= 0x08000000  # CREATE_NO_WINDOW
+        return _orig_pydub_Popen(*args, **kwargs)
+    _subprocess.Popen = _silent_Popen
+    _pydub_utils.Popen = _silent_Popen
 
 # Ensure pydub can discover ffmpeg without requiring system PATH setup.
 try:
@@ -253,18 +265,9 @@ def _is_cta_image_prompt(prompt: str) -> bool:
 
 
 def _shared_cta_image_path() -> str:
-    assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-    shared_dir = os.path.join(assets_dir, "Outro Image")
-    os.makedirs(shared_dir, exist_ok=True)
-
-    new_path = os.path.join(shared_dir, "cta_scene.jpg")
-    old_path = os.path.join(assets_dir, "_shared", "cta_scene.jpg")
-    if not os.path.exists(new_path) and os.path.exists(old_path):
-        try:
-            shutil.copy2(old_path, new_path)
-        except Exception:
-            pass
-    return new_path
+    assets_dir = os.path.join(_ai_app_data_dir(), "assets", "Outro Image")
+    os.makedirs(assets_dir, exist_ok=True)
+    return os.path.join(assets_dir, "cta_scene.jpg")
 
 
 def _cta_visual_instruction() -> str:

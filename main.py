@@ -156,15 +156,15 @@ def make_scene_overlay_text(narration: str, visual: str = "") -> str:
     return ""
 
 class ImageGenerationThread(QThread):
-    finished = pyqtSignal(bool, str)
-    
+    generation_done = pyqtSignal(bool, str)
+
     def __init__(self, prompt, output_path, overlay_text="", narration=""):
         super().__init__()
         self.prompt = prompt
         self.output_path = output_path
         self.overlay_text = overlay_text
         self.narration = narration
-        
+
     def run(self):
         success = generate_image_from_prompt(
             self.prompt,
@@ -172,10 +172,10 @@ class ImageGenerationThread(QThread):
             self.overlay_text,
             self.narration,
         )
-        self.finished.emit(success, self.output_path)
+        self.generation_done.emit(success, self.output_path)
 
 class AudioGenerationThread(QThread):
-    finished = pyqtSignal(bool, str, str)
+    generation_done = pyqtSignal(bool, str, str)
 
     def __init__(self, text, output_path, engine="gemini", voice=None):
         super().__init__()
@@ -188,10 +188,10 @@ class AudioGenerationThread(QThread):
         import traceback as _tb
         try:
             success = generate_audio_from_text(self.text, self.output_path, self.engine, self.voice)
-            self.finished.emit(success, self.output_path, "" if success else "generate_audio_from_text returned False")
+            self.generation_done.emit(success, self.output_path, "" if success else "generate_audio_from_text returned False")
         except Exception as e:
             print(f"AudioGenerationThread error:\n{_tb.format_exc()}")
-            self.finished.emit(False, self.output_path, str(e))
+            self.generation_done.emit(False, self.output_path, str(e))
 
 class BulkGenerationThread(QThread):
     """
@@ -214,10 +214,13 @@ class BulkGenerationThread(QThread):
         self.is_cancelled = True
 
     def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         os.makedirs(self.topic_folder, exist_ok=True)
 
         total = len(self.scenes)
         failed = []
+        img_done = 0
+        aud_done = 0
 
         for i, scene in enumerate(self.scenes):
             if self.is_cancelled:
@@ -226,49 +229,98 @@ class BulkGenerationThread(QThread):
 
             idx = i + 1
 
-            # --- Image ---
+            # --- Resolve paths ---
             img_path = os.path.join(self.topic_folder, f"scene_{idx}.jpg")
-            if self.skip_existing and os.path.exists(img_path):
-                scene['img_path'] = img_path
-                self.scene_progress.emit(i, 'img', '⏭️ Image skipped (exists)')
-            else:
-                self.scene_progress.emit(i, 'img', f'⏳ Generating image {idx}/{total}...')
-                img_ok = generate_image_from_prompt(
-                    scene.get('visual', ''),
-                    img_path,
-                    make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', '')),
-                    scene.get('narration', ''),
-                )
-                if img_ok:
-                    scene['img_path'] = img_path
-                    db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
-                    self.scene_progress.emit(i, 'img', '✅ Image done')
-                else:
-                    failed.append(f"Scene {idx} Image")
-                    self.scene_progress.emit(i, 'img', '❌ Image failed')
+            existing_img = scene.get('img_path', '')
+            img_exists = os.path.exists(img_path) or (existing_img and os.path.exists(existing_img))
 
-            # --- Audio ---
             audio_ext = "wav" if self.tts_engine == "gemini" else "mp3"
             aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{audio_ext}")
-            # Also check the alternate extension in case a different engine was used before
             alt_ext = "mp3" if audio_ext == "wav" else "wav"
             alt_aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{alt_ext}")
-            existing_on_disk = os.path.exists(aud_path) or os.path.exists(alt_aud_path)
-            if self.skip_existing and existing_on_disk:
-                actual_path = aud_path if os.path.exists(aud_path) else alt_aud_path
-                scene['audio_path'] = actual_path
+            existing_aud = scene.get('audio_path', '')
+            aud_exists = (
+                os.path.exists(aud_path) or
+                os.path.exists(alt_aud_path) or
+                (existing_aud and os.path.exists(existing_aud))
+            )
+
+            skip_img = self.skip_existing and img_exists
+            skip_aud = self.skip_existing and aud_exists
+
+            # --- Emit immediate skips ---
+            if skip_img:
+                scene['img_path'] = img_path if os.path.exists(img_path) else existing_img
+                self.scene_progress.emit(i, 'img', '⏭️ Image skipped (exists)')
+            if skip_aud:
+                if os.path.exists(aud_path):
+                    scene['audio_path'] = aud_path
+                elif os.path.exists(alt_aud_path):
+                    scene['audio_path'] = alt_aud_path
+                else:
+                    scene['audio_path'] = existing_aud
                 self.scene_progress.emit(i, 'aud', '⏭️ Audio skipped (exists)')
-            else:
-                self.scene_progress.emit(i, 'aud', f'⏳ Generating audio {idx}/{total}...')
-                aud_ok = generate_audio_from_text(scene.get('narration', ''), aud_path, self.tts_engine, self.tts_voice)
+
+            if skip_img and skip_aud:
+                continue
+
+            # --- Run image + audio in parallel ---
+            def _gen_img(_scene=scene, _img_path=img_path, _i=i, _total=total, _img_n=img_done+1):
+                self.scene_progress.emit(_i, 'img', f'⏳ Generating image {_img_n}/{_total}...')
+                try:
+                    return generate_image_from_prompt(
+                        _scene.get('visual', ''),
+                        _img_path,
+                        make_scene_overlay_text(_scene.get('narration', ''), _scene.get('visual', '')),
+                        _scene.get('narration', ''),
+                    ), None
+                except Exception as e:
+                    return False, str(e)
+
+            def _gen_aud(_scene=scene, _aud_path=aud_path, _i=i, _total=total, _aud_n=aud_done+1):
+                self.scene_progress.emit(_i, 'aud', f'⏳ Generating audio {_aud_n}/{_total}...')
+                try:
+                    return generate_audio_from_text(_scene.get('narration', ''), _aud_path, self.tts_engine, self.tts_voice), None
+                except Exception as e:
+                    return False, str(e)
+
+            futures = {}
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                if not skip_img:
+                    futures['img'] = ex.submit(_gen_img)
+                if not skip_aud:
+                    futures['aud'] = ex.submit(_gen_aud)
+
+            if 'img' in futures:
+                try:
+                    img_ok, img_err = futures['img'].result()
+                except Exception as e:
+                    img_ok, img_err = False, str(e)
+                if img_ok:
+                    img_done += 1
+                    scene['img_path'] = img_path
+                    db.update_scene_asset(scene.get('db_id'), 'img_path', img_path)
+                    self.scene_progress.emit(i, 'img', f'✅ Image done ({img_done}/{total})')
+                else:
+                    err_detail = f": {img_err}" if img_err else ""
+                    failed.append(f"Scene {idx} Image{err_detail}")
+                    self.scene_progress.emit(i, 'img', f'❌ Image failed{err_detail}')
+
+            if 'aud' in futures:
+                try:
+                    aud_ok, aud_err = futures['aud'].result()
+                except Exception as e:
+                    aud_ok, aud_err = False, str(e)
                 if aud_ok:
+                    aud_done += 1
                     scene['audio_path'] = aud_path
                     db.update_scene_asset(scene.get('db_id'), 'audio_path', aud_path)
                     db.update_scene_asset(scene.get('db_id'), 'tts_voice', self.tts_voice or '')
-                    self.scene_progress.emit(i, 'aud', '✅ Audio done')
+                    self.scene_progress.emit(i, 'aud', f'✅ Audio done ({aud_done}/{total})')
                 else:
-                    failed.append(f"Scene {idx} Audio")
-                    self.scene_progress.emit(i, 'aud', '❌ Audio failed')
+                    err_detail = f": {aud_err}" if aud_err else ""
+                    failed.append(f"Scene {idx} Audio{err_detail}")
+                    self.scene_progress.emit(i, 'aud', f'❌ Audio failed{err_detail}')
 
         if failed:
             self.all_done.emit(False, f"Completed with failures: {', '.join(failed)}")
@@ -544,10 +596,12 @@ class VideoStitchingThread(QThread):
         if not os.path.exists(ffprobe):
             ffprobe = "ffprobe"
         try:
+            _no_win = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
             r = subprocess.run(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", media_path],
                 capture_output=True, text=True, timeout=15,
+                **_no_win,
             )
             return float(r.stdout.strip())
         except Exception:
@@ -591,12 +645,14 @@ class VideoStitchingThread(QThread):
             + [cmd[-1]]
         )
 
+        _no_win = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
         proc = subprocess.Popen(
             progress_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            **_no_win,
         )
 
         # Drain stderr in background so it never blocks stdout reads
@@ -720,13 +776,14 @@ class VideoStitchingThread(QThread):
             for p in clip_paths:
                 f.write(f"file '{p.replace(chr(92), '/')}'\n")
 
+        _no_win = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
         r = subprocess.run([
             ffmpeg, "-y",
             "-f", "concat", "-safe", "0", "-i", concat_list,
             "-c", "copy",
             "-movflags", "+faststart",
             self.output_path,
-        ], capture_output=True)
+        ], capture_output=True, **_no_win)
 
         if r.returncode != 0:
             self.finished.emit(False,
@@ -1077,9 +1134,9 @@ class StoryboardTab(QWidget):
             btn_layout_img = QHBoxLayout()
             gen_img_btn = QPushButton("🖼️ Generate Image")
             gen_img_btn.setProperty("class", "primary-button")
-            view_img_btn = QPushButton("👁️ View Image")
+            view_img_btn = QPushButton("👁  View Image")
             view_img_btn.setProperty("class", "secondary-button")
-            view_img_btn.setFixedWidth(110)
+            view_img_btn.setFixedWidth(140)
             view_img_btn.hide()
             
             status_lbl_img = QLabel("")
@@ -1095,14 +1152,17 @@ class StoryboardTab(QWidget):
             btn_layout_aud = QHBoxLayout()
             gen_aud_btn = QPushButton("🎙️ Generate Audio")
             gen_aud_btn.setProperty("class", "primary-button")
-            play_aud_btn = QPushButton("▶️ Play Audio")
+            play_aud_btn = QPushButton("▶  Play Audio")
             play_aud_btn.setProperty("class", "secondary-button")
-            play_aud_btn.setFixedWidth(110)
+            play_aud_btn.setFixedWidth(140)
             play_aud_btn.hide()
             
             status_lbl_aud = QLabel("")
             status_lbl_aud.setStyleSheet("color: #a6e3a1;")
-            
+            _existing_aud = scene.get('audio_path', '')
+            if _existing_aud and os.path.exists(_existing_aud):
+                play_aud_btn.show()
+
             btn_layout_aud.addWidget(gen_aud_btn)
             btn_layout_aud.addWidget(play_aud_btn)
             btn_layout_aud.addWidget(status_lbl_aud)
@@ -1115,6 +1175,12 @@ class StoryboardTab(QWidget):
             img_preview.setAlignment(Qt.AlignCenter)
             img_preview.setStyleSheet("background: #181825; border-radius: 6px; color: #585b70;")
             img_preview.setFixedSize(200, 112) # 16:9 aspect ratio forced
+            _existing_img = scene.get('img_path', '')
+            if _existing_img and os.path.exists(_existing_img):
+                _pix = QPixmap(_existing_img)
+                img_preview.setPixmap(_pix.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                view_img_btn.show()
+                view_img_btn.clicked.connect(lambda _, p=_existing_img: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
             right_layout.addWidget(img_preview)
             
             card_main_layout.addLayout(left_layout, stretch=3)
@@ -1143,25 +1209,24 @@ class StoryboardTab(QWidget):
                 setattr(self, f"img_thread_{idx}", thread)
                 
                 def on_finish(success, path):
-                    btn.setEnabled(True)
-                    if success:
-                        lbl.setText("✅ Image Generated!")
-                        lbl.setStyleSheet("color: #a6e3a1;") # Green
-                        pixmap = QPixmap(path)
-                        # Scale down for preview
-                        p_lbl.setPixmap(pixmap.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
-                        scene['img_path'] = path
+                    try:
+                        btn.setEnabled(True)
+                        if success:
+                            lbl.setText("✅ Image Generated!")
+                            lbl.setStyleSheet("color: #a6e3a1;")
+                            pixmap = QPixmap(path)
+                            p_lbl.setPixmap(pixmap.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                            scene['img_path'] = path
+                            db.update_scene_asset(scene.get('db_id'), 'img_path', path)
+                            view_btn.show()
+                            view_btn.clicked.connect(lambda: os.startfile(os.path.abspath(path)) if os.name == 'nt' else None)
+                        else:
+                            lbl.setText("❌ Image Failed.")
+                            lbl.setStyleSheet("color: #f38ba8;")
+                    except RuntimeError:
+                        pass
                         
-                        # Sync string path to Database
-                        db.update_scene_asset(scene.get('db_id'), 'img_path', path)
-                        
-                        view_btn.show()
-                        view_btn.clicked.connect(lambda: os.startfile(os.path.abspath(path)) if os.name == 'nt' else None)
-                    else:
-                        lbl.setText("❌ Image Failed.")
-                        lbl.setStyleSheet("color: #f38ba8;") # Red
-                        
-                thread.finished.connect(on_finish)
+                thread.generation_done.connect(on_finish)
                 thread.start()
 
             def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn, tdir=self._topic_folder):
@@ -1177,29 +1242,29 @@ class StoryboardTab(QWidget):
                 setattr(self, f"aud_thread_{idx}", thread)
                 
                 def on_finish(success, path, err_msg):
-                    btn.setEnabled(True)
-                    if success:
-                        lbl.setText(f"✅ Audio Saved.")
-                        lbl.setStyleSheet("color: #a6e3a1;")
-                        scene['audio_path'] = path
+                    try:
+                        btn.setEnabled(True)
+                        if success:
+                            lbl.setText("✅ Audio Saved.")
+                            lbl.setStyleSheet("color: #a6e3a1;")
+                            scene['audio_path'] = path
+                            db.update_scene_asset(scene.get('db_id'), 'audio_path', path)
+                            db.update_scene_asset(scene.get('db_id'), 'tts_voice', voice or '')
+                            scene['tts_voice'] = voice or ''
+                            play_btn.show()
+                            play_btn.clicked.connect(lambda: os.startfile(os.path.abspath(path)) if os.name == 'nt' else None)
+                        else:
+                            lbl.setText(f"❌ Audio Failed: {err_msg}" if err_msg else "❌ Audio Failed.")
+                            lbl.setStyleSheet("color: #f38ba8;")
+                    except RuntimeError:
+                        pass
                         
-                        # Sync String Path to Database
-                        db.update_scene_asset(scene.get('db_id'), 'audio_path', path)
-                        db.update_scene_asset(scene.get('db_id'), 'tts_voice', voice or '')
-                        scene['tts_voice'] = voice or ''
-                        
-                        play_btn.show()
-                        play_btn.clicked.connect(lambda: os.startfile(os.path.abspath(path)) if os.name == 'nt' else None)
-                    else:
-                        lbl.setText(f"❌ Audio Failed: {err_msg}" if err_msg else "❌ Audio Failed.")
-                        lbl.setStyleSheet("color: #f38ba8;")
-                        
-                thread.finished.connect(on_finish)
+                thread.generation_done.connect(on_finish)
                 thread.start()
                 
                 
-            gen_img_btn.clicked.connect(create_img_handler)
-            gen_aud_btn.clicked.connect(create_aud_handler)
+            gen_img_btn.clicked.connect(lambda _, f=create_img_handler: f())
+            gen_aud_btn.clicked.connect(lambda _, f=create_aud_handler: f())
             
             # Register this card's UI refs so BulkGenerationThread can update them
             scene_ui_refs.append((scene, status_lbl_img, status_lbl_aud, img_preview, view_img_btn, play_aud_btn))
@@ -1281,6 +1346,10 @@ class StoryboardTab(QWidget):
                     if asset_type == 'img':
                         lbl_img.setText(msg)
                         lbl_img.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
+                        if '⏳' in msg:
+                            self._start_spin(lbl_img, msg)
+                        else:
+                            self._stop_spin(lbl_img)
                         if '✅' in msg:
                             path = scenes[idx].get('img_path', '')
                             if path and os.path.exists(path):
@@ -1291,6 +1360,10 @@ class StoryboardTab(QWidget):
                     else:
                         lbl_aud.setText(msg)
                         lbl_aud.setStyleSheet("color: #a6e3a1;" if '✅' in msg else ("color: #f9e2af;" if '⏳' in msg else "color: #f38ba8;"))
+                        if '⏳' in msg:
+                            self._start_spin(lbl_aud, msg)
+                        else:
+                            self._stop_spin(lbl_aud)
                         if '✅' in msg:
                             path = scenes[idx].get('audio_path', '')
                             if path:
@@ -1942,8 +2015,9 @@ class HistoryTab(QWidget):
             img_row = QHBoxLayout()
             gen_img_btn = QPushButton("🖼️ Generate Image")
             gen_img_btn.setProperty("class", "primary-button")
-            view_img_btn = QPushButton("👁️ View Image")
+            view_img_btn = QPushButton("👁  View Image")
             view_img_btn.setProperty("class", "secondary-button")
+            view_img_btn.setFixedWidth(140)
             view_img_btn.hide()
             img_status = QLabel("")
             img_status.setStyleSheet("color: #a6e3a1;")
@@ -1956,8 +2030,9 @@ class HistoryTab(QWidget):
             aud_row = QHBoxLayout()
             gen_aud_btn = QPushButton("🎙️ Generate Audio")
             gen_aud_btn.setProperty("class", "primary-button")
-            play_aud_btn = QPushButton("🔊 Play Audio")
+            play_aud_btn = QPushButton("▶  Play Audio")
             play_aud_btn.setProperty("class", "secondary-button")
+            play_aud_btn.setFixedWidth(140)
             play_aud_btn.hide()
             aud_status = QLabel("")
             aud_status.setStyleSheet("color: #a6e3a1;")
@@ -1974,6 +2049,7 @@ class HistoryTab(QWidget):
             if scene.get('img_path') and os.path.exists(scene['img_path']):
                 pix = QPixmap(scene['img_path'])
                 thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                thumb.show()
                 view_img_btn.show()
                 try:
                     view_img_btn.clicked.disconnect()
@@ -2010,26 +2086,29 @@ class HistoryTab(QWidget):
                 setattr(self, f"history_img_thread_{idx}", thread)
 
                 def on_finish(success, path):
-                    btn.setEnabled(True)
-                    if success:
-                        status_lbl.setText("✅ Image Generated!")
-                        status_lbl.setStyleSheet("color: #a6e3a1;")
-                        s['img_path'] = path
-                        db.update_scene_asset(s.get('db_id'), 'img_path', path)
-                        pix = QPixmap(path)
-                        preview_lbl.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
-                        view_btn.show()
-                        try:
-                            view_btn.clicked.disconnect()
-                        except TypeError:
-                            pass
-                        view_btn.clicked.connect(lambda _, p=path: self._show_history_image_preview(p))
-                    else:
-                        status_lbl.setText("❌ Image Failed.")
-                        status_lbl.setStyleSheet("color: #f38ba8;")
-                    self._update_restitch_button_visibility()
+                    try:
+                        btn.setEnabled(True)
+                        if success:
+                            status_lbl.setText("✅ Image Generated!")
+                            status_lbl.setStyleSheet("color: #a6e3a1;")
+                            s['img_path'] = path
+                            db.update_scene_asset(s.get('db_id'), 'img_path', path)
+                            pix = QPixmap(path)
+                            preview_lbl.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                            view_btn.show()
+                            try:
+                                view_btn.clicked.disconnect()
+                            except TypeError:
+                                pass
+                            view_btn.clicked.connect(lambda _, p=path: self._show_history_image_preview(p))
+                        else:
+                            status_lbl.setText("❌ Image Failed.")
+                            status_lbl.setStyleSheet("color: #f38ba8;")
+                        self._update_restitch_button_visibility()
+                    except RuntimeError:
+                        pass
 
-                thread.finished.connect(on_finish)
+                thread.generation_done.connect(on_finish)
                 thread.start()
 
             def create_aud_handler(
@@ -2057,34 +2136,37 @@ class HistoryTab(QWidget):
                 setattr(self, f"history_aud_thread_{idx}", thread)
 
                 def on_finish(success, path, err_msg):
-                    btn.setEnabled(True)
-                    if success:
-                        status_lbl.setText("✅ Audio Saved.")
-                        status_lbl.setStyleSheet("color: #a6e3a1;")
-                        s['audio_path'] = path
-                        s['tts_voice'] = voice
-                        self._history_scene_audio_paths[idx] = path
-                        db.update_scene_asset(s.get('db_id'), 'audio_path', path)
-                        db.update_scene_asset(s.get('db_id'), 'tts_voice', voice or '')
-                        play_btn.show()
-                        try:
-                            play_btn.clicked.disconnect()
-                        except TypeError:
-                            pass
-                        play_btn.clicked.connect(
-                            lambda _, p=path, scene_idx=idx, lbl=status_lbl:
-                            self._play_history_audio(p, scene_idx, lbl, None)
-                        )
-                    else:
-                        status_lbl.setText(f"❌ Audio Failed: {err_msg}" if err_msg else "❌ Audio Failed.")
-                        status_lbl.setStyleSheet("color: #f38ba8;")
-                    self._update_restitch_button_visibility()
+                    try:
+                        btn.setEnabled(True)
+                        if success:
+                            status_lbl.setText("✅ Audio Saved.")
+                            status_lbl.setStyleSheet("color: #a6e3a1;")
+                            s['audio_path'] = path
+                            s['tts_voice'] = voice
+                            self._history_scene_audio_paths[idx] = path
+                            db.update_scene_asset(s.get('db_id'), 'audio_path', path)
+                            db.update_scene_asset(s.get('db_id'), 'tts_voice', voice or '')
+                            play_btn.show()
+                            try:
+                                play_btn.clicked.disconnect()
+                            except TypeError:
+                                pass
+                            play_btn.clicked.connect(
+                                lambda _, p=path, scene_idx=idx, lbl=status_lbl:
+                                self._play_history_audio(p, scene_idx, lbl, None)
+                            )
+                        else:
+                            status_lbl.setText(f"❌ Audio Failed: {err_msg}" if err_msg else "❌ Audio Failed.")
+                            status_lbl.setStyleSheet("color: #f38ba8;")
+                        self._update_restitch_button_visibility()
+                    except RuntimeError:
+                        pass
 
-                thread.finished.connect(on_finish)
+                thread.generation_done.connect(on_finish)
                 thread.start()
 
-            gen_img_btn.clicked.connect(create_img_handler)
-            gen_aud_btn.clicked.connect(create_aud_handler)
+            gen_img_btn.clicked.connect(lambda _, f=create_img_handler: f())
+            gen_aud_btn.clicked.connect(lambda _, f=create_aud_handler: f())
 
             card_layout.addLayout(text_block, stretch=3)
             card_layout.addWidget(thumb)
@@ -2166,6 +2248,10 @@ class HistoryTab(QWidget):
                 if asset_type == 'img':
                     lbl_img.setText(msg)
                     lbl_img.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                    if is_in_progress:
+                        self._start_spin(lbl_img, msg)
+                    else:
+                        self._stop_spin(lbl_img)
                     if is_done and scene.get('img_path') and os.path.exists(scene['img_path']):
                         pix = QPixmap(scene['img_path'])
                         thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
@@ -2178,6 +2264,10 @@ class HistoryTab(QWidget):
                 else:
                     lbl_aud.setText(msg)
                     lbl_aud.setStyleSheet("color: #a6e3a1;" if is_done else ("color: #f9e2af;" if is_in_progress else "color: #f38ba8;"))
+                    if is_in_progress:
+                        self._start_spin(lbl_aud, msg)
+                    else:
+                        self._stop_spin(lbl_aud)
                     if is_done and scene.get('audio_path') and os.path.exists(scene['audio_path']):
                         self._history_scene_audio_paths[idx] = scene['audio_path']
                         play_btn.show()
@@ -2772,6 +2862,12 @@ class AppWindow(QMainWindow):
         self.current_scenes = []
         self.current_topic = ""
 
+        self._spinning_labels: dict = {}
+        self._spinner_frame = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(500)
+        self._spinner_timer.timeout.connect(self._tick_spinner)
+
         # Connect Signals for Wizard Flow
         self.script_tab.next_requested.connect(self.on_script_next)
         self.script_tab.next_requested_topic.connect(lambda t: setattr(self, 'current_topic', t))
@@ -2847,6 +2943,27 @@ class AppWindow(QMainWindow):
             return ""
         safe_topic = make_safe_topic(self.current_topic)
         return os.path.join(_app_data_dir(), 'assets', safe_topic, f"{safe_topic}.mp4")
+
+    def _start_spin(self, label, text):
+        self._spinning_labels[label] = text
+        if not self._spinner_timer.isActive():
+            self._spinner_timer.start()
+
+    def _stop_spin(self, label):
+        self._spinning_labels.pop(label, None)
+        if not self._spinning_labels:
+            self._spinner_timer.stop()
+
+    def _tick_spinner(self):
+        _frames = ["⏳", "⌛"]
+        self._spinner_frame = (self._spinner_frame + 1) % len(_frames)
+        frame = _frames[self._spinner_frame]
+        for label, base_text in list(self._spinning_labels.items()):
+            try:
+                new_text = frame + base_text[1:] if base_text[:1] in ("⏳", "⌛") else base_text
+                label.setText(new_text)
+            except RuntimeError:
+                self._spinning_labels.pop(label, None)
 
     def on_script_next(self, scenes):
         self.current_scenes = scenes
