@@ -11,7 +11,7 @@ added_files = [
     (os.path.join(project_dir, 'db.py'),           '.'),
     (os.path.join(project_dir, 'ai_generator.py'), '.'),
     (os.path.join(project_dir, 'app_icon.ico'),    '.'),
-    (os.path.join(project_dir, '.env'),             '.'),
+    (os.path.join(project_dir, '.env.example'),      '.'),
 ]
 
 hidden_imports = [

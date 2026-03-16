@@ -20,7 +20,7 @@ _ENV_PATH = os.path.join(_get_app_data_base(), ".env")
 
 # On first frozen run, copy bundled .env into writable location if it doesn't exist yet
 if getattr(sys, 'frozen', False):
-    _bundled_env = os.path.join(sys._MEIPASS, ".env")
+    _bundled_env = os.path.join(sys._MEIPASS, ".env.example")
     if os.path.exists(_bundled_env) and not os.path.exists(_ENV_PATH):
         import shutil as _sh
         _sh.copy2(_bundled_env, _ENV_PATH)

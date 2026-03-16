@@ -2,7 +2,7 @@
 .env
 *.env
 *.env.*
-!.env.template           # Keep the template so others know what vars to set
+!.env.example            # Keep the example so others know what vars to set
 
 # Google Cloud service account key (never commit credentials!)
 *.json
