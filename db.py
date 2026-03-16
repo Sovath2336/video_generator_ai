@@ -1,6 +1,9 @@
 import sqlite3
 import os
 import sys
+from datetime import datetime, timezone, timedelta
+
+_ICT = timezone(timedelta(hours=7))
 
 def _get_data_dir() -> str:
     if getattr(sys, 'frozen', False):
@@ -57,9 +60,10 @@ def save_script_and_scenes(topic, duration, script_text, scenes):
     """
     conn = get_connection()
     c = conn.cursor()
+    now = datetime.now(_ICT).strftime('%Y-%m-%d %H:%M:%S')
     c.execute(
-        'INSERT INTO topics (topic, duration, script_text) VALUES (?, ?, ?)',
-        (topic, duration, script_text)
+        'INSERT INTO topics (topic, duration, script_text, created_at) VALUES (?, ?, ?, ?)',
+        (topic, duration, script_text, now)
     )
     topic_id = c.lastrowid
     

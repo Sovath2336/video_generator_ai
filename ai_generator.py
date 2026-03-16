@@ -156,6 +156,18 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
 
         estimated_scenes_min = max(6, int(duration_minutes * 1.5) + 1)
         estimated_scenes_max = max(8, int(duration_minutes * 2) + 2)
+
+        # If the topic contains a specific number (e.g. "Top 5 Ways", "7 Reasons"),
+        # lock the scene count to match: 1 title card + N main content + 1 CTA outro.
+        _topic_number_match = re.search(r'\b(\d+)\b', topic)
+        _topic_number = None
+        if _topic_number_match:
+            n = int(_topic_number_match.group(1))
+            if 2 <= n <= 20:
+                _topic_number = n
+                estimated_scenes_min = estimated_scenes_max = n + 2
+                logger.info("Topic number detected: %d → forcing %d scenes total.", n, n + 2)
+
         words_per_scene = int((duration_minutes * 140) / ((estimated_scenes_min + estimated_scenes_max) / 2))
         logger.info("Script plan: %d-%d scenes, ~%d words/scene",
                     estimated_scenes_min, estimated_scenes_max, words_per_scene)
@@ -170,13 +182,21 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
         
         cta_visual = _cta_visual_instruction()
 
+        _scenes_instruction = (
+            f"SCENES: Generate exactly {estimated_scenes_min} scenes "
+            f"(1 title card intro + {_topic_number} main content scenes + 1 CTA outro). "
+            f"The {_topic_number} main content scenes must each cover one of the {_topic_number} items implied by the title."
+            if _topic_number is not None
+            else f"SCENES: Generate between {estimated_scenes_min} and {estimated_scenes_max} scenes."
+        )
+
         prompt = f"""You are an expert YouTube infographic video scriptwriter with a talent for cinematic storytelling and audience retention.
 {web_note}
 
 Write a complete, YouTube-ready infographic video script about: "{topic}"
 
 TARGET: Exactly {duration_minutes} minutes of narration (~{duration_minutes * 140} words total across all scenes).
-SCENES: Generate between {estimated_scenes_min} and {estimated_scenes_max} scenes.
+{_scenes_instruction}
 NARRATION PER SCENE: Each main content scene must have ~{words_per_scene} words of narration (minimum {int(words_per_scene * 0.8)}, maximum {int(words_per_scene * 1.2)}). Do NOT write short 1-2 sentence narrations. Each scene should feel like a full paragraph of documentary narration.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -184,7 +204,7 @@ MANDATORY SCENE STRUCTURE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [Scene 1] — BRIEF TITLE CARD INTRO (mandatory, separate intro scene)
-Visual: A bold, cinematic title card image. Do not show other texts other than the topic title "{topic}" as large stylised text centred on screen, set against a dramatic thematic background that immediately communicates the subject. The image should feel like a movie poster or YouTube thumbnail - eye-catching, high contrast, professional.
+Visual: A bold, cinematic title card image. The ONLY readable text allowed in this image is the exact title "{topic}" as large stylised text centred on screen. Do NOT include any subtitles, taglines, descriptions, episode numbers, dates, bylines, captions, or any other words, letters, or typography beyond the title itself. Set the title against a dramatic thematic background that immediately communicates the subject. The image should feel like a movie poster or YouTube thumbnail — eye-catching, high contrast, professional. STRICT RULE: title text only, nothing else written anywhere in the image.
 Narration: Keep this separate intro extremely brief: 0-1 very short sentence, about 3-12 words total. This scene is only the title-card intro. Do NOT begin the main explanation yet.
 
 [Scene 2] — HOOK & CONTENT INTRO (mandatory, first real content scene)
@@ -370,16 +390,17 @@ def _is_title_card_prompt(prompt: str) -> bool:
     return "title card" in text or "topic title" in text
 
 
-def _build_image_prompt(prompt: str, image_text: str | None = None, narration: str | None = None) -> str:
+def _build_image_prompt(prompt: str, image_text: str | None = None, narration: str | None = None, force_title_card: bool = False) -> str:
     base_prompt = f"Generate an image with 16:9 aspect ratio of: {prompt}"
     image_text = _normalize_image_text(image_text)
     narration = re.sub(r"\s+", " ", (narration or "")).strip()
-    if _is_title_card_prompt(prompt) and image_text:
+    if (force_title_card or _is_title_card_prompt(prompt)) and image_text:
         return (
             f"{base_prompt}\n\n"
-            f'Important: include this exact title text in the image: "{image_text}". '
-            "Make it large, clean, and central as part of the title-card design. "
-            "Do not add any other readable text."
+            f'Important: the ONLY text that may appear anywhere in this image is the exact title: "{image_text}". '
+            "Render it large, bold, and centred as the sole typographic element. "
+            "Do NOT add any subtitles, taglines, descriptions, captions, bylines, episode numbers, dates, "
+            "or any other words, letters, or symbols beyond the title itself."
         )
     core_idea_note = ""
     if narration:
@@ -398,11 +419,12 @@ def _build_image_prompt(prompt: str, image_text: str | None = None, narration: s
 
 _VALID_IMAGE_SIZES = {"512", "1K", "2K", "4K"}
 
-def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str | None = None, narration: str | None = None) -> bool:
+def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str | None = None, narration: str | None = None, is_title_card: bool = False) -> bool:
     """
     Uses Imagen 3 via the Gemini API to generate an image and save it to output_path.
     `overlay_text` is only used for intro title-card scenes. Other scenes stay text-free.
     `narration` is used to anchor the image to the scene's core idea.
+    `is_title_card` forces the overlay_text to be embedded as the title regardless of the visual prompt wording.
     Returns True if successful, False otherwise.
     """
     scene_label = os.path.basename(output_path)
@@ -441,7 +463,7 @@ def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str 
             try:
                 result = client.models.generate_content(
                     model='gemini-3.1-flash-image-preview',
-                    contents=_build_image_prompt(prompt, overlay_text, narration),
+                    contents=_build_image_prompt(prompt, overlay_text, narration, force_title_card=is_title_card),
                     config=genai_types.GenerateContentConfig(
                         response_modalities=['TEXT', 'IMAGE'],
                         image_config=genai_types.ImageConfig(

@@ -1,5 +1,5 @@
 #define AppName      "Infographic Video Generator"
-#define AppVersion   "1.1.0"
+#define AppVersion   "1.2.0"
 #define AppPublisher "Your Name"
 #define AppURL       "https://yourwebsite.com"
 #define AppExeName   "VideoGeneratorAI.exe"

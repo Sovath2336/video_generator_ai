@@ -32,8 +32,8 @@ from PyQt5.QtWidgets import (
     QScrollArea, QProgressBar, QSpinBox, QSplitter, QListWidget, QListWidgetItem,
     QTextBrowser, QCheckBox, QGridLayout, QSystemTrayIcon, QComboBox, QDialog, QSlider
 )
-from PyQt5.QtGui import QPixmap, QIcon
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QUrl
+from PyQt5.QtGui import QPixmap, QIcon, QPainter, QPen, QColor, QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QUrl, QRectF, QEvent
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from ai_generator import (
     correct_topic_title,
@@ -160,12 +160,13 @@ def make_scene_overlay_text(narration: str, visual: str = "") -> str:
 class ImageGenerationThread(QThread):
     generation_done = pyqtSignal(bool, str)
 
-    def __init__(self, prompt, output_path, overlay_text="", narration=""):
+    def __init__(self, prompt, output_path, overlay_text="", narration="", is_title_card=False):
         super().__init__()
         self.prompt = prompt
         self.output_path = output_path
         self.overlay_text = overlay_text
         self.narration = narration
+        self.is_title_card = is_title_card
 
     def run(self):
         success = generate_image_from_prompt(
@@ -173,6 +174,7 @@ class ImageGenerationThread(QThread):
             self.output_path,
             self.overlay_text,
             self.narration,
+            self.is_title_card,
         )
         self.generation_done.emit(success, self.output_path)
 
@@ -205,13 +207,14 @@ class BulkGenerationThread(QThread):
     scene_progress = pyqtSignal(int, str, str)
     all_done = pyqtSignal(bool, str)
 
-    def __init__(self, scenes, topic_folder, tts_engine="gemini", tts_voice=None, skip_existing=False):
+    def __init__(self, scenes, topic_folder, tts_engine="gemini", tts_voice=None, skip_existing=False, topic=""):
         super().__init__()
         self.scenes = scenes
         self.topic_folder = topic_folder  # absolute path to topic sub-folder
         self.tts_engine = tts_engine
         self.tts_voice = tts_voice
         self.skip_existing = skip_existing
+        self.topic = topic
         self.is_cancelled = False
 
     def cancel(self):
@@ -245,16 +248,19 @@ class BulkGenerationThread(QThread):
                 return
 
             idx = i + 1
+            # Use db_id as filename so each generation session gets unique files,
+            # even across re-runs of the same topic. Falls back to positional index.
+            file_key = scene.get('db_id') or idx
 
             # --- Resolve paths ---
-            img_path = os.path.join(self.topic_folder, f"scene_{idx}.jpg")
+            img_path = os.path.join(self.topic_folder, f"scene_{file_key}.jpg")
             existing_img = scene.get('img_path', '')
             img_exists = os.path.exists(img_path) or (existing_img and os.path.exists(existing_img))
 
             audio_ext = "wav" if self.tts_engine == "gemini" else "mp3"
-            aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{audio_ext}")
+            aud_path = os.path.join(self.topic_folder, f"scene_{file_key}.{audio_ext}")
             alt_ext = "mp3" if audio_ext == "wav" else "wav"
-            alt_aud_path = os.path.join(self.topic_folder, f"scene_{idx}.{alt_ext}")
+            alt_aud_path = os.path.join(self.topic_folder, f"scene_{file_key}.{alt_ext}")
             existing_aud = scene.get('audio_path', '')
             aud_exists = (
                 os.path.exists(aud_path) or
@@ -274,12 +280,20 @@ class BulkGenerationThread(QThread):
                 self.scene_progress.emit(i, 'img', '⏭️ Image skipped (exists)')
             else:
                 self.scene_progress.emit(i, 'img', '⏳ Generating image...')
+                # For the first scene (title card), always use the topic title as overlay text
+                is_title_card = (i == 0)
+                overlay = (
+                    self.topic
+                    if is_title_card and self.topic
+                    else make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', ''))
+                )
                 try:
                     img_ok = generate_image_from_prompt(
                         scene.get('visual', ''),
                         img_path,
-                        make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', '')),
+                        overlay,
                         scene.get('narration', ''),
+                        is_title_card,
                     )
                 except BaseException as e:
                     logger.exception("Scene %d image generation raised: %s", idx, e)
@@ -425,12 +439,18 @@ class VideoStitchingThread(QThread):
         return ""
 
     _SUBTITLE_MAX_WORDS = 12
+    _BREAK_WORDS = {
+        'and', 'but', 'or', 'so', 'because', 'when', 'while', 'after',
+        'before', 'although', 'though', 'if', 'that', 'which', 'who',
+        'where', 'then', 'yet', 'as', 'since', 'until', 'unless',
+    }
 
     @staticmethod
     def _sentence_word_spans(narration: str) -> list:
         max_w = VideoStitchingThread._SUBTITLE_MAX_WORDS
-        sentence_re = re.compile(r'[^.!?]+[.!?]*', re.UNICODE)
-        word_re = re.compile(r"[A-Za-z0-9]+(?:[\x27’][A-Za-z0-9]+)*", re.UNICODE)
+        break_words = VideoStitchingThread._BREAK_WORDS
+        sentence_re = re.compile(r'[^.!?,;]+[.!?,;]*', re.UNICODE)
+        word_re = re.compile(r"[A-Za-z0-9]+(?:[\x27'][A-Za-z0-9]+)*", re.UNICODE)
         spans = []
         for sent_m in sentence_re.finditer(narration):
             sent_text = sent_m.group()
@@ -440,16 +460,23 @@ class VideoStitchingThread(QThread):
                 continue
             if len(words) <= max_w:
                 spans.append((sent_start + words[0].start(), sent_start + words[-1].end()))
-            else:
-                n_parts = (len(words) + max_w - 1) // max_w
-                per_part = len(words) // n_parts
-                remainder = len(words) % n_parts
-                idx = 0
-                for p in range(n_parts):
-                    count = per_part + (1 if p < remainder else 0)
-                    part_words = words[idx: idx + count]
-                    spans.append((sent_start + part_words[0].start(), sent_start + part_words[-1].end()))
-                    idx += count
+                continue
+            remaining = list(range(len(words)))
+            while remaining:
+                if len(remaining) <= max_w:
+                    part = [words[i] for i in remaining]
+                    spans.append((sent_start + part[0].start(), sent_start + part[-1].end()))
+                    break
+                split_at = None
+                for i in range(min(max_w - 1, len(remaining) - 1), max_w // 2, -1):
+                    if words[remaining[i]].group().lower() in break_words:
+                        split_at = i
+                        break
+                if split_at is None:
+                    split_at = max_w
+                part = [words[i] for i in remaining[:split_at]]
+                spans.append((sent_start + part[0].start(), sent_start + part[-1].end()))
+                remaining = remaining[split_at:]
         return spans
 
     @staticmethod
@@ -464,14 +491,14 @@ class VideoStitchingThread(QThread):
         if not texts:
             return [{"text": narration, "start_sec": 0.0, "end_sec": duration}]
         step = duration / len(texts)
-        return [
+        return VideoStitchingThread._fix_quote_marks([
             {
                 "text": text,
                 "start_sec": step * idx,
                 "end_sec": duration if idx == len(texts) - 1 else step * (idx + 1),
             }
             for idx, text in enumerate(texts)
-        ]
+        ])
 
     @staticmethod
     def _subtitle_chunks(narration: str, word_timings: list, duration: float) -> list:
@@ -529,8 +556,31 @@ class VideoStitchingThread(QThread):
             else:
                 end_sec = duration
             chunks.append({"text": span_text, "start_sec": start_sec, "end_sec": end_sec})
-        return chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+        return VideoStitchingThread._fix_quote_marks(
+            chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+        )
 
+    @staticmethod
+    def _fix_quote_marks(chunks: list) -> list:
+        in_quote = False
+        for chunk in chunks:
+            text = chunk["text"]
+            count = text.count('"')
+            if in_quote and not text.startswith('"'):
+                text = '"' + text
+            if in_quote:
+                count = text.count('"')
+            if count % 2 != 0:
+                if in_quote:
+                    text = text + '"'
+                    in_quote = False
+                else:
+                    text = text + '"'
+                    in_quote = True
+            else:
+                in_quote = False
+            chunk["text"] = text
+        return chunks
 
     @classmethod
     def _subtitle_vf(cls, narration: str, word_timings: list, duration: float, subtitle_dir: str, scene_idx: int) -> str:
@@ -820,18 +870,67 @@ class VideoStitchingThread(QThread):
                 f.write(f"file '{p.replace(chr(92), '/')}'\n")
 
         _no_win = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-        r = subprocess.run([
-            ffmpeg, "-y",
-            "-f", "concat", "-safe", "0", "-i", concat_list,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            self.output_path,
-        ], capture_output=True, **_no_win)
 
-        if r.returncode != 0:
-            self.finished.emit(False,
-                f"Assembly failed:\n{r.stderr.decode(errors='replace')[-1000:]}")
-            return
+        # Check whether we can embed the title card as the video's cover art/thumbnail
+        thumbnail_img = self.scenes[0].get("img_path") if self.scenes else None
+        has_thumbnail = bool(thumbnail_img and os.path.exists(thumbnail_img))
+
+        if has_thumbnail:
+            # Assemble to a temp file first, then re-run with thumbnail attached
+            temp_assembled = self.output_path + ".tmp_assembled.mp4"
+            r = subprocess.run([
+                ffmpeg, "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                temp_assembled,
+            ], capture_output=True, **_no_win)
+
+            if r.returncode != 0:
+                self.finished.emit(False,
+                    f"Assembly failed:\n{r.stderr.decode(errors='replace')[-1000:]}")
+                return
+
+            # Embed the title card image as the MP4 cover art so it shows as the thumbnail
+            r2 = subprocess.run([
+                ffmpeg, "-y",
+                "-i", temp_assembled,
+                "-i", thumbnail_img,
+                "-map", "0",
+                "-map", "1",
+                "-c", "copy",
+                "-c:v:1", "mjpeg",
+                "-disposition:v:1", "attached_pic",
+                "-movflags", "+faststart",
+                self.output_path,
+            ], capture_output=True, **_no_win)
+
+            if r2.returncode != 0:
+                logger.warning("Thumbnail embedding failed (non-fatal): %s",
+                               r2.stderr.decode(errors='replace')[-200:])
+                # Fall back: use the assembled video without embedded thumbnail
+                try:
+                    os.replace(temp_assembled, self.output_path)
+                except OSError:
+                    pass
+            else:
+                try:
+                    os.remove(temp_assembled)
+                except OSError:
+                    pass
+        else:
+            r = subprocess.run([
+                ffmpeg, "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_list,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                self.output_path,
+            ], capture_output=True, **_no_win)
+
+            if r.returncode != 0:
+                self.finished.emit(False,
+                    f"Assembly failed:\n{r.stderr.decode(errors='replace')[-1000:]}")
+                return
 
         self.progress_pct.emit(100)
         self.finished.emit(True, self.output_path)
@@ -877,32 +976,106 @@ class TopicCorrectionThread(QThread):
         self.correction_done.emit(corrected)
 
 
+class SpinnerOverlay(QWidget):
+    """
+    Animated arc-spinner overlay rendered on top of a parent widget.
+    Call start() to show and stop() to hide.
+    """
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(12)          # ~83 fps → smooth arc rotation
+        self._timer.timeout.connect(self._tick)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setGeometry(parent.rect())
+        self.hide()
+
+    def start(self):
+        self._angle = 0
+        self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 3) % 360
+        self.update()
+
+    def paintEvent(self, event):          # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Semi-transparent dark backdrop
+        p.fillRect(self.rect(), QColor(24, 24, 37, 215))
+
+        cx, cy = self.width() // 2, self.height() // 2
+        r = max(36, min(self.height() // 6, 60))
+        offset_y = 20                         # shift arc slightly above center
+
+        arc_rect = QRectF(cx - r, cy - r - offset_y, r * 2, r * 2)
+
+        # Dim track ring
+        track = QPen(QColor(49, 50, 68))
+        track.setWidth(8)
+        track.setCapStyle(Qt.RoundCap)
+        p.setPen(track)
+        p.drawArc(arc_rect, 0, 360 * 16)
+
+        # Bright spinning arc
+        arc = QPen(QColor(137, 180, 250))     # #89b4fa – accent blue
+        arc.setWidth(8)
+        arc.setCapStyle(Qt.RoundCap)
+        p.setPen(arc)
+        p.drawArc(arc_rect, (-self._angle) * 16, 260 * 16)
+
+        # Label below the arc
+        p.setPen(QColor(166, 173, 200))       # #a6adc8
+        f = QFont("Segoe UI", 13)
+        p.setFont(f)
+        label_rect = QRectF(0, cy + r - offset_y + 14, self.width(), 28)
+        p.drawText(label_rect, Qt.AlignHCenter | Qt.AlignVCenter, "Generating script…")
+
+        p.end()
+
+
 class ScriptTab(QWidget):
     next_requested = pyqtSignal(list)
     next_requested_topic = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
-        
-        # Topic Input Section
+        root = QVBoxLayout()
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(0)
+
+        self._script_tabs = QTabWidget()
+        self._script_tabs.setStyleSheet("QTabBar::tab { min-width: 160px; }")
+
+        draft_widget = QWidget()
+        draft_layout = QVBoxLayout(draft_widget)
+        draft_layout.setSpacing(15)
+        draft_layout.setContentsMargins(0, 12, 0, 0)
+
         topic_layout = QHBoxLayout()
         self.topic_input = QLineEdit()
         self.topic_input.setPlaceholderText("Enter a topic (e.g., 'How photosynthesis works')")
         self.topic_input.setMinimumHeight(38)
-        
+
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(1, 60)
         self.duration_spin.setValue(5)
         self.duration_spin.setSuffix(" min")
-        self.duration_spin.setMinimumHeight(38)
-        self.duration_spin.setMinimumWidth(80)
-        
+        self.duration_spin.setFixedSize(78, 28)
+
         self.generate_btn = QPushButton("✨ Generate Script")
         self.generate_btn.setProperty("class", "primary-button")
         self.generate_btn.clicked.connect(self.generate_script)
+        self.topic_input.returnPressed.connect(self.generate_script)
 
         self.web_search_chk = QCheckBox("🌐 Search Web")
         self.web_search_chk.setToolTip(
@@ -910,27 +1083,52 @@ class ScriptTab(QWidget):
             "information about the topic before writing the script."
         )
         self.web_search_chk.setStyleSheet("QCheckBox { font-size: 13px; color: #cdd6f4; }")
-        
+
         topic_layout.addWidget(QLabel("🚀 Topic:"))
         topic_layout.addWidget(self.topic_input)
         topic_layout.addWidget(QLabel("⏱️ Length:"))
         topic_layout.addWidget(self.duration_spin)
         topic_layout.addWidget(self.web_search_chk)
         topic_layout.addWidget(self.generate_btn)
-        layout.addLayout(topic_layout)
+        draft_layout.addLayout(topic_layout)
 
-        # --- Analyze Text Panel ---
-        analyze_frame = QFrame()
-        analyze_frame.setStyleSheet("QFrame { background-color: #2b2b36; border-radius: 8px; padding: 8px; }")
-        analyze_frame_layout = QVBoxLayout(analyze_frame)
-        analyze_frame_layout.setSpacing(6)
+        lbl = QLabel("Draft or Edit Your Script:")
+        lbl.setProperty("class", "h2")
+        draft_layout.addWidget(lbl)
 
-        analyze_header = QHBoxLayout()
+        self.script_editor = QTextEdit()
+        self.script_editor.setAcceptRichText(False)
+        self.script_editor.setPlaceholderText("Enter the infographic script. Break it down into logical scenes.\\nExample:\\n[Scene 1]\\nVisual: A sun shining on a leaf.\\nNarration: Photosynthesis starts here.")
+        self._spinner = SpinnerOverlay(self.script_editor)
+        self._waiting_for_first_chunk = False
+        self.script_editor.installEventFilter(self)
+        draft_layout.addWidget(self.script_editor)
+
+        btn_layout = QHBoxLayout()
+        self.enhance_btn = QPushButton("🪄 Enhance Script")
+        self.enhance_btn.setProperty("class", "secondary-button")
+        self.split_btn = QPushButton("✂️ Split into Scenes")
+        self.split_btn.setProperty("class", "primary-button")
+        self.split_btn.clicked.connect(self.parse_and_go_next)
+        btn_layout.addWidget(self.enhance_btn)
+        btn_layout.addWidget(self.split_btn)
+        btn_layout.addStretch()
+        self.next_btn = QPushButton("Next: Storyboard ➔")
+        self.next_btn.setProperty("class", "success-button")
+        self.next_btn.clicked.connect(self.parse_and_go_next)
+        btn_layout.addWidget(self.next_btn)
+        draft_layout.addLayout(btn_layout)
+
+        self._script_tabs.addTab(draft_widget, "Generate with Gemini")
+
+        analyze_widget = QWidget()
+        analyze_layout = QVBoxLayout(analyze_widget)
+        analyze_layout.setSpacing(12)
+        analyze_layout.setContentsMargins(0, 12, 0, 0)
+
         analyze_title = QLabel("📝 Analyze & Convert Text to Scenes")
         analyze_title.setProperty("class", "h2")
-        analyze_header.addWidget(analyze_title)
-        analyze_header.addStretch()
-        analyze_frame_layout.addLayout(analyze_header)
+        analyze_layout.addWidget(analyze_title)
 
         self.analyze_input = QTextEdit()
         self.analyze_input.setAcceptRichText(False)
@@ -938,8 +1136,8 @@ class ScriptTab(QWidget):
             "Paste any text here (article, blog post, notes, essay...)\n"
             "AI will analyze it and extract scenes with visual prompts and narration."
         )
-        self.analyze_input.setMaximumHeight(120)
-        analyze_frame_layout.addWidget(self.analyze_input)
+        self.analyze_input.setMinimumHeight(150)
+        analyze_layout.addWidget(self.analyze_input)
 
         analyze_btn_row = QHBoxLayout()
         self.analyze_btn = QPushButton("🔍 Analyze & Generate Scenes")
@@ -950,39 +1148,12 @@ class ScriptTab(QWidget):
         analyze_btn_row.addWidget(self.analyze_btn)
         analyze_btn_row.addWidget(self.analyze_status)
         analyze_btn_row.addStretch()
-        analyze_frame_layout.addLayout(analyze_btn_row)
+        analyze_layout.addLayout(analyze_btn_row)
 
-        layout.addWidget(analyze_frame)
-        
-        # Script Editor Section
-        lbl = QLabel("Draft or Edit Your Script Here:")
-        lbl.setProperty("class", "h2")
-        layout.addWidget(lbl)
-        
-        self.script_editor = QTextEdit()
-        self.script_editor.setAcceptRichText(False)
-        self.script_editor.setPlaceholderText("Enter the infographic script. Break it down into logical scenes.\\nExample:\\n[Scene 1]\\nVisual: A sun shining on a leaf.\\nNarration: Photosynthesis starts here.")
-        layout.addWidget(self.script_editor)
-        
-        # Additional Buttons
-        btn_layout = QHBoxLayout()
-        self.enhance_btn = QPushButton("🪄 Enhance Script")
-        self.enhance_btn.setProperty("class", "secondary-button")
-        self.split_btn = QPushButton("✂️ Split into Scenes")
-        self.split_btn.setProperty("class", "primary-button")
-        self.split_btn.clicked.connect(self.parse_and_go_next)
-        btn_layout.addWidget(self.enhance_btn)
-        btn_layout.addWidget(self.split_btn)
-        
-        # Next Step
-        btn_layout.addStretch()
-        self.next_btn = QPushButton("Next: Storyboard ➔")
-        self.next_btn.setProperty("class", "success-button")
-        self.next_btn.clicked.connect(self.parse_and_go_next)
-        btn_layout.addWidget(self.next_btn)
-        
-        layout.addLayout(btn_layout)
-        self.setLayout(layout)
+        self._script_tabs.addTab(analyze_widget, "Paste Custom Script")
+
+        root.addWidget(self._script_tabs)
+        self.setLayout(root)
 
     def parse_and_go_next(self):
         text = self.script_editor.toPlainText().strip()
@@ -1036,6 +1207,8 @@ class ScriptTab(QWidget):
         self.generate_btn.setEnabled(False)
         self.generate_btn.setText("✏️ Correcting topic...")
         self.script_editor.clear()
+        self._waiting_for_first_chunk = True
+        self._spinner.start()
 
         # Step 1: correct the topic title via Gemini, then kick off script generation.
         self._correction_thread = TopicCorrectionThread(topic)
@@ -1071,35 +1244,54 @@ class ScriptTab(QWidget):
         self.analyze_status.setText("⏳ Sending to Gemini...")
         self.analyze_status.setStyleSheet("color: #f9e2af;")
         self.script_editor.clear()
+        self._waiting_for_first_chunk = True
+        self._spinner.start()
         
         self.analyze_thread = AnalyzeTextThread(source_text)
         self.analyze_thread.chunk_received.connect(self.on_chunk_received)
         self.analyze_thread.finished.connect(self.on_analyze_done)
         self.analyze_thread.start()
-        
-    def on_analyze_done(self):
-        self.analyze_btn.setEnabled(True)
-        self.analyze_btn.setText("🔍 Analyze & Generate Scenes")
-        self.analyze_status.setText("✅ Done! Review script below then click Next.")
-        self.analyze_status.setStyleSheet("color: #a6e3a1;")
-        
+
     def on_chunk_received(self, chunk):
+        # Hide the spinner the moment the first character arrives
+        if self._waiting_for_first_chunk:
+            self._waiting_for_first_chunk = False
+            self._spinner.stop()
         # Insert raw text continuously to the end
         cursor = self.script_editor.textCursor()
         cursor.movePosition(cursor.End)
         cursor.insertText(chunk)
         self.script_editor.setTextCursor(cursor)
-        
+
     def on_script_generated(self):
+        self._spinner.stop()          # failsafe – hide if no chunks arrived
+        self._waiting_for_first_chunk = False
         self.generate_btn.setEnabled(True)
         self.generate_btn.setText("✨ Generate Script")
+
+    def on_analyze_done(self):
+        self._spinner.stop()
+        self._waiting_for_first_chunk = False
+        self.analyze_btn.setEnabled(True)
+        self.analyze_btn.setText("🔍 Analyze & Generate Scenes")
+        self.analyze_status.setText("✅ Done! Switch to Draft tab to review, then click Next.")
+        self.analyze_status.setStyleSheet("color: #a6e3a1;")
+        self._script_tabs.setCurrentIndex(0)
+
+    def eventFilter(self, obj, event):
+        # Keep the spinner overlay filling the script editor as it resizes
+        if obj is self.script_editor and event.type() == QEvent.Resize:
+            self._spinner.setGeometry(self.script_editor.rect())
+        return super().eventFilter(obj, event)
 
 class StoryboardTab(QWidget):
     next_requested = pyqtSignal()
     back_requested = pyqtSignal()
+    bulk_job_started = pyqtSignal(object, str, object)  # (thread, topic, scenes)
 
     def __init__(self):
         super().__init__()
+        self._topic = ''
         layout = QVBoxLayout()
         layout.setContentsMargins(20, 20, 20, 20)
 
@@ -1164,6 +1356,7 @@ class StoryboardTab(QWidget):
         self.setLayout(layout)
 
     def load_scenes(self, scenes, topic=''):
+        self._topic = topic
         self._topic_folder = os.path.join(
             _app_data_dir(), 'assets', make_safe_topic(topic)
         )
@@ -1194,10 +1387,29 @@ class StoryboardTab(QWidget):
             header = QLabel(f"🎬 Scene {i+1}")
             header.setProperty("class", "h2")
             left_layout.addWidget(header)
-            
-            visual_lbl = QLabel(f"<b>Visual (Nano-Banana Prompt):</b><br>{scene['visual']}")
-            visual_lbl.setWordWrap(True)
-            left_layout.addWidget(visual_lbl)
+
+            # Scene 1 (intro card): editable visual prompt so the user can tweak and regenerate
+            _visual_edit = None
+            if i == 0:
+                visual_hdr = QLabel("<b>Visual Prompt (intro card — editable):</b>")
+                visual_hdr.setWordWrap(True)
+                left_layout.addWidget(visual_hdr)
+                _visual_edit = QTextEdit()
+                _visual_edit.setPlainText(scene['visual'])
+                _visual_edit.setAcceptRichText(False)
+                _visual_edit.setMaximumHeight(88)
+                _visual_edit.setStyleSheet(
+                    "QTextEdit{background:#1e1e2e;color:#cdd6f4;"
+                    "border:1px solid #45475a;border-radius:4px;font-size:12px;padding:4px;}"
+                )
+                _visual_edit.textChanged.connect(
+                    lambda s=scene, e=_visual_edit: s.update({'visual': e.toPlainText()})
+                )
+                left_layout.addWidget(_visual_edit)
+            else:
+                visual_lbl = QLabel(f"<b>Visual (Nano-Banana Prompt):</b><br>{scene['visual']}")
+                visual_lbl.setWordWrap(True)
+                left_layout.addWidget(visual_lbl)
             
             narration_lbl = QLabel(f"<b>Narration (TTS):</b><br>{scene['narration']}")
             narration_lbl.setWordWrap(True)
@@ -1258,24 +1470,35 @@ class StoryboardTab(QWidget):
             card_main_layout.addLayout(right_layout, stretch=1)
             
             # Capture the scope for the handlers
+            _is_title_card_scene = (i == 0)
+            _overlay = (
+                self._topic
+                if _is_title_card_scene and self._topic
+                else make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', ''))
+            )
+
             def create_img_handler(
                 idx=i,
                 prompt=scene['visual'],
-                overlay_text=make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', '')),
+                prompt_edit=_visual_edit,
+                overlay_text=_overlay,
                 narration=scene.get('narration', ''),
                 lbl=status_lbl_img,
                 btn=gen_img_btn,
                 p_lbl=img_preview,
                 view_btn=view_img_btn,
                 tdir=self._topic_folder,
+                title_card=_is_title_card_scene,
+                _file_key=scene.get('db_id') or (i + 1),
             ):
                 os.makedirs(tdir, exist_ok=True)
-                out_path = os.path.join(tdir, f"scene_{idx+1}.jpg")
+                out_path = os.path.join(tdir, f"scene_{_file_key}.jpg")
                 btn.setEnabled(False)
                 lbl.setText("⏳ Generating Image...")
                 lbl.setStyleSheet("color: #f9e2af;") # Yellow
-                
-                thread = ImageGenerationThread(prompt, out_path, overlay_text, narration)
+
+                actual_prompt = prompt_edit.toPlainText().strip() if prompt_edit else prompt
+                thread = ImageGenerationThread(actual_prompt, out_path, overlay_text, narration, title_card)
                 # Store reference so it is not garbage collected
                 setattr(self, f"img_thread_{idx}", thread)
                 
@@ -1385,8 +1608,9 @@ class StoryboardTab(QWidget):
             for j, (sc, lbl_img, lbl_aud, p_lbl, v_btn, pl_btn) in enumerate(scene_ui_refs):
                 status_map[j] = (lbl_img, lbl_aud, p_lbl, v_btn, pl_btn)
 
-            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine, voice, skip_existing)
+            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine, voice, skip_existing, self._topic)
             setattr(self, '_bulk_thread', bulk_thread)
+            self.bulk_job_started.emit(bulk_thread, self._topic, scenes)
 
             try:
                 self.stop_btn.clicked.disconnect()
@@ -1524,7 +1748,7 @@ class ExportTab(QWidget):
         # ── Render button ────────────────────────────────────────────────
         self.render_btn = QPushButton("🎬 Stitch Final Video")
         self.render_btn.setProperty("class", "success-button")
-        self.render_btn.setMinimumHeight(44)
+        self.render_btn.setMinimumHeight(32)
         self.render_btn.setEnabled(False)
         self.render_btn.clicked.connect(self.start_stitch.emit)
         root.addWidget(self.render_btn)
@@ -1533,11 +1757,11 @@ class ExportTab(QWidget):
         action_row = QHBoxLayout()
         self.view_video_btn = QPushButton("🎬 View Video")
         self.view_video_btn.setProperty("class", "success-button")
-        self.view_video_btn.setMinimumHeight(40)
+        self.view_video_btn.setMinimumHeight(32)
         self.view_video_btn.hide()
         self.open_folder_btn = QPushButton("📂 Open Folder")
         self.open_folder_btn.setProperty("class", "secondary-button")
-        self.open_folder_btn.setMinimumHeight(40)
+        self.open_folder_btn.setMinimumHeight(32)
         self.open_folder_btn.hide()
         action_row.addWidget(self.view_video_btn)
         action_row.addWidget(self.open_folder_btn)
@@ -1662,8 +1886,8 @@ class HistoryTab(QWidget):
         title_row = QHBoxLayout()
         title = QLabel("📚 History")
         title.setProperty("class", "h2")
-        refresh_btn = QPushButton("🔄 Refresh")
-        refresh_btn.setProperty("class", "primary-button")
+        refresh_btn = QPushButton("↻ Refresh")
+        refresh_btn.setProperty("class", "secondary-button")
         refresh_btn.clicked.connect(self.load_history)
         title_row.addWidget(title)
         title_row.addStretch()
@@ -1917,6 +2141,12 @@ class HistoryTab(QWidget):
         if not self._topic_rows:
             self._clear_history_detail()
 
+    def select_topic(self, topic: str):
+        for i, row in enumerate(self._topic_rows):
+            if row[1] == topic:
+                self.topic_list.setCurrentRow(i)
+                return
+
     def _clear_history_detail(self):
         self._current_topic_id = None
         self._current_topic = ""
@@ -2135,16 +2365,22 @@ class HistoryTab(QWidget):
                     self._play_history_audio(p, idx, lbl, None)
                 )
 
-            def create_img_handler(idx=i, s=scene, status_lbl=img_status, btn=gen_img_btn, preview_lbl=thumb, view_btn=view_img_btn):
+            def create_img_handler(idx=i, s=scene, status_lbl=img_status, btn=gen_img_btn, preview_lbl=thumb, view_btn=view_img_btn, _title_card=(i == 0)):
                 out_path = os.path.join(self._history_topic_folder, f"scene_{idx+1}.jpg")
                 btn.setEnabled(False)
                 status_lbl.setText("⏳ Generating Image...")
                 status_lbl.setStyleSheet("color: #f9e2af;")
+                _overlay = (
+                    self._current_topic
+                    if _title_card and self._current_topic
+                    else make_scene_overlay_text(s.get('narration', ''), s.get('visual', ''))
+                )
                 thread = ImageGenerationThread(
                     s.get('visual', ''),
                     out_path,
-                    make_scene_overlay_text(s.get('narration', ''), s.get('visual', '')),
+                    _overlay,
                     s.get('narration', ''),
+                    _title_card,
                 )
                 setattr(self, f"history_img_thread_{idx}", thread)
 
@@ -2277,7 +2513,7 @@ class HistoryTab(QWidget):
         status_map = {idx: refs for idx, refs in enumerate(self._history_scene_refs)}
 
         self._history_bulk_thread = BulkGenerationThread(
-            self._current_scenes, self._history_topic_folder, engine, voice, skip_existing
+            self._current_scenes, self._history_topic_folder, engine, voice, skip_existing, self._current_topic
         )
 
         try:
@@ -2931,6 +3167,262 @@ The <b>⚙️ Settings</b> tab lets you manage your API key:<br><br>
 
 
 
+class BackgroundJobsTab(QWidget):
+    """
+    Shows all active and completed background jobs grouped by topic.
+    Each topic gets one card; generation and stitching rows are added inside it.
+    """
+    load_job_requested = pyqtSignal(list, str)  # (scenes, topic) → open in Storyboard
+    open_in_history_requested = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._job_counter = 0
+        self._job_refs = {}      # job_id → dict  (keeps threads/widgets alive)
+        self._topic_cards = {}   # topic str → {'rows_layout': QVBoxLayout, 'card': QFrame}
+
+        root = QVBoxLayout()
+        root.setContentsMargins(20, 20, 20, 20)
+        root.setSpacing(12)
+
+        hdr = QLabel("⏳ Background Jobs")
+        hdr.setProperty("class", "h2")
+        root.addWidget(hdr)
+
+        desc = QLabel(
+            "Each topic's generation and stitching are grouped in one card. "
+            "Start new topics at any time — all jobs run independently."
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#a6adc8; font-size:12px;")
+        root.addWidget(desc)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self._list_widget = QWidget()
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setSpacing(14)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._empty_lbl = QLabel(
+            "No jobs yet.\nClick ⚡ Auto-Generate All Scenes in the Storyboard tab to start one."
+        )
+        self._empty_lbl.setAlignment(Qt.AlignCenter)
+        self._empty_lbl.setStyleSheet("color:#585b70; font-size:13px; padding:40px;")
+        self._list_layout.addWidget(self._empty_lbl)
+        self._list_layout.addStretch()
+        scroll.setWidget(self._list_widget)
+        root.addWidget(scroll)
+        self.setLayout(root)
+
+    # ── internal helpers ──────────────────────────────────────────────────
+
+    def _get_or_create_topic_card(self, topic: str) -> dict:
+        """Return the existing card dict for `topic`, or create a new one."""
+        if topic in self._topic_cards:
+            return self._topic_cards[topic]
+
+        self._empty_lbl.hide()
+
+        # Outer topic card
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame#topicCard{"
+            "  background:#2b2b36;"
+            "  border-radius:10px;"
+            "  border:1px solid #313244;"
+            "}"
+        )
+        card.setObjectName("topicCard")
+        card_vl = QVBoxLayout(card)
+        card_vl.setContentsMargins(16, 14, 16, 14)
+        card_vl.setSpacing(0)
+
+        # Topic header
+        hdr = QLabel(f"🎬  {topic}")
+        hdr.setStyleSheet(
+            "font-weight:bold; color:#cdd6f4; font-size:15px;"
+            "padding-bottom:10px; border-bottom:1px solid #45475a;"
+        )
+        card_vl.addWidget(hdr)
+
+        # Container for job rows
+        rows_w = QWidget()
+        rows_w.setStyleSheet("background:transparent;")
+        rows_vl = QVBoxLayout(rows_w)
+        rows_vl.setContentsMargins(0, 10, 0, 0)
+        rows_vl.setSpacing(10)
+        card_vl.addWidget(rows_w)
+
+        # Insert newest topic card at top (above stretch)
+        self._list_layout.insertWidget(0, card)
+
+        entry = {'card': card, 'rows_layout': rows_vl}
+        self._topic_cards[topic] = entry
+        return entry
+
+    def _make_job_row(self, rows_layout, icon: str, label: str, bar_css: str):
+        """Build a job-row widget inside a topic card. Returns (bar, status_lbl, btn_layout)."""
+        row = QFrame()
+        row.setStyleSheet("QFrame{background:#1e1e2e; border-radius:6px;}")
+        rl = QVBoxLayout(row)
+        rl.setContentsMargins(12, 8, 12, 8)
+        rl.setSpacing(5)
+
+        title_lbl = QLabel(f"{icon}  {label}")
+        title_lbl.setStyleSheet("color:#a6adc8; font-size:12px; font-weight:bold;")
+        rl.addWidget(title_lbl)
+
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(7)
+        bar.setStyleSheet(bar_css)
+        rl.addWidget(bar)
+
+        status_lbl = QLabel("⏳  Starting…")
+        status_lbl.setStyleSheet("color:#f9e2af; font-size:12px;")
+        rl.addWidget(status_lbl)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(6)
+        rl.addLayout(btn_layout)
+
+        rows_layout.addWidget(row)
+        return bar, status_lbl, btn_layout
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def add_job(self, thread, topic: str, scenes: list):
+        """Register a BulkGenerationThread as a row inside the topic's card."""
+        job_id = f"job_{self._job_counter}"
+        self._job_counter += 1
+        total = max(1, len(scenes))
+        done_count = [0]
+
+        card_data = self._get_or_create_topic_card(topic)
+        bar, status_lbl, btn_layout = self._make_job_row(
+            card_data['rows_layout'],
+            "🎨", "Generating Images & Audio",
+            "QProgressBar{background:#313244;border-radius:3px;}"
+            "QProgressBar::chunk{background:qlineargradient("
+            "x1:0,y1:0,x2:1,y2:0,stop:0 #2563eb,stop:1 #a855f7);border-radius:3px;}",
+        )
+
+        open_btn = QPushButton("📂 Open in Storyboard")
+        open_btn.setProperty("class", "success-button")
+        open_btn.setMinimumHeight(30)
+        open_btn.hide()
+        history_btn = QPushButton("📚 Open in History")
+        history_btn.setProperty("class", "secondary-button")
+        history_btn.setMinimumHeight(30)
+        history_btn.hide()
+        stop_btn = QPushButton("⏹ Stop")
+        stop_btn.setProperty("class", "danger-button")
+        stop_btn.setMinimumHeight(30)
+        btn_layout.addWidget(open_btn)
+        btn_layout.addWidget(history_btn)
+        btn_layout.addWidget(stop_btn)
+        btn_layout.addStretch()
+
+        def on_progress(idx, asset_type, msg):
+            try:
+                if asset_type == 'aud' and ('done' in msg.lower() or 'skipped' in msg.lower()):
+                    done_count[0] = min(done_count[0] + 1, total)
+                pct = int(done_count[0] / total * 100)
+                bar.setValue(pct)
+                status_lbl.setText(f"⏳  {done_count[0]} / {total} scenes done")
+            except RuntimeError:
+                pass
+
+        def on_done(success, msg):
+            try:
+                stop_btn.hide()
+                if success:
+                    bar.setValue(100)
+                    status_lbl.setText(f"✅  All {total} scenes ready")
+                    status_lbl.setStyleSheet("color:#a6e3a1; font-size:12px;")
+                    open_btn.show()
+                    history_btn.show()
+                else:
+                    status_lbl.setText(f"❌  {msg[:80]}")
+                    status_lbl.setStyleSheet("color:#f38ba8; font-size:12px;")
+            except RuntimeError:
+                pass
+
+        thread.scene_progress.connect(on_progress, Qt.QueuedConnection)
+        thread.all_done.connect(on_done, Qt.QueuedConnection)
+        open_btn.clicked.connect(lambda: self.load_job_requested.emit(scenes, topic))
+        history_btn.clicked.connect(lambda: self.open_in_history_requested.emit(topic))
+        stop_btn.clicked.connect(lambda: (
+            thread.cancel(),
+            stop_btn.setEnabled(False),
+            stop_btn.setText("⏳ Stopping…"),
+        ))
+
+        self._job_refs[job_id] = {
+            'thread': thread, 'scenes': scenes, 'topic': topic,
+            'bar': bar, 'status_lbl': status_lbl,
+        }
+        return job_id
+
+    def add_stitch_job(self, thread, topic: str):
+        """Register a VideoStitchingThread as a row inside the topic's card."""
+        job_id = f"job_{self._job_counter}"
+        self._job_counter += 1
+
+        card_data = self._get_or_create_topic_card(topic)
+        bar, status_lbl, btn_layout = self._make_job_row(
+            card_data['rows_layout'],
+            "🎞️", "Stitching Video",
+            "QProgressBar{background:#313244;border-radius:3px;}"
+            "QProgressBar::chunk{background:qlineargradient("
+            "x1:0,y1:0,x2:1,y2:0,stop:0 #a855f7,stop:1 #ec4899);border-radius:3px;}",
+        )
+
+        def on_msg(msg):
+            try:
+                status_lbl.setText(f"⏳  {msg}")
+            except RuntimeError:
+                pass
+
+        def on_pct(pct):
+            try:
+                bar.setValue(pct)
+            except RuntimeError:
+                pass
+
+        def on_done(success, result):
+            try:
+                if success:
+                    bar.setValue(100)
+                    status_lbl.setText(f"✅  Done — {os.path.basename(result)}")
+                    status_lbl.setStyleSheet("color:#a6e3a1; font-size:12px;")
+                else:
+                    status_lbl.setText(f"❌  {result[:80]}")
+                    status_lbl.setStyleSheet("color:#f38ba8; font-size:12px;")
+            except RuntimeError:
+                pass
+
+        thread.progress_msg.connect(on_msg, Qt.QueuedConnection)
+        thread.progress_pct.connect(on_pct, Qt.QueuedConnection)
+        thread.finished.connect(on_done, Qt.QueuedConnection)
+
+        history_btn = QPushButton("📚 Open in History")
+        history_btn.setProperty("class", "secondary-button")
+        history_btn.setMinimumHeight(30)
+        history_btn.clicked.connect(lambda: self.open_in_history_requested.emit(topic))
+        btn_layout.addWidget(history_btn)
+        btn_layout.addStretch()
+
+        self._job_refs[job_id] = {
+            'thread': thread, 'topic': topic,
+            'bar': bar, 'status_lbl': status_lbl,
+        }
+        return job_id
+
+
 class AppWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2950,13 +3442,15 @@ class AppWindow(QMainWindow):
         self.storyboard_tab = StoryboardTab()
         self.export_tab = ExportTab()
         self.history_tab = HistoryTab()
+        self.jobs_tab = BackgroundJobsTab()
         self.settings_tab = SettingsTab()
         self.howto_tab = HowToUseTab()
-        
+
         self.tabs.addTab(self.script_tab, "✍️ Scripting")
         self.tabs.addTab(self.storyboard_tab, "🎨 Storyboard")
         self.tabs.addTab(self.export_tab, "🎬 Export Video")
         self.tabs.addTab(self.history_tab, "📚 History")
+        self.tabs.addTab(self.jobs_tab, "⏳ Jobs")
         self.tabs.addTab(self.settings_tab, "⚙️ Settings")
         self.tabs.addTab(self.howto_tab, "❓ How to Use")
         
@@ -2965,6 +3459,12 @@ class AppWindow(QMainWindow):
         
         self.current_scenes = []
         self.current_topic = ""
+        self._active_threads = []  # keeps BulkGenerationThread objects alive until done
+
+        self._job_count_timer = QTimer(self)
+        self._job_count_timer.setInterval(1000)
+        self._job_count_timer.timeout.connect(self._update_jobs_tab_label)
+        self._job_count_timer.start()
 
         self._spinning_labels: dict = {}
         self._spinner_frame = 0
@@ -2983,6 +3483,9 @@ class AppWindow(QMainWindow):
         self.script_tab.next_requested.connect(lambda _: self.history_tab.load_history())
         # Re-stitching from history
         self.history_tab.restitch_requested.connect(self.on_history_restitch)
+        self.storyboard_tab.bulk_job_started.connect(self._on_bulk_job_started)
+        self.jobs_tab.load_job_requested.connect(self._on_load_job_in_storyboard)
+        self.jobs_tab.open_in_history_requested.connect(self._on_open_job_in_history)
 
         self._APP_NAME = "Infographic Video Generator"
 
@@ -3097,7 +3600,6 @@ class AppWindow(QMainWindow):
             return
             
         self.export_tab.start_render_ui()
-        self.export_tab.set_progress(0, "Preparing clips…")
 
         # Video goes into the same topic sub-folder
         safe_topic = make_safe_topic(self.current_topic)
@@ -3106,14 +3608,16 @@ class AppWindow(QMainWindow):
         out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
 
         self.stitch_thread = VideoStitchingThread(self.current_scenes, out_path)
-        self.stitch_thread.progress_msg.connect(
-            lambda msg: self.export_tab.status_lbl.setText(msg)
-        )
-        self.stitch_thread.progress_pct.connect(
-            lambda pct: self.export_tab.set_progress(pct, self.export_tab.status_lbl.text())
-        )
         self.stitch_thread.finished.connect(self.on_stitch_finished)
+        self._active_threads.append(self.stitch_thread)
+        self.jobs_tab.add_stitch_job(self.stitch_thread, self.current_topic)
+        self._update_jobs_tab_label()
+        self.stitch_thread.finished.connect(
+            lambda ok, msg, t=self.stitch_thread: self._on_any_bulk_job_done(t),
+            Qt.QueuedConnection,
+        )
         self.stitch_thread.start()
+        self.tabs.setCurrentWidget(self.jobs_tab)
         
     def on_stitch_finished(self, success, result_msg):
         self.export_tab.stop_render_ui(success, result_msg)
@@ -3125,6 +3629,42 @@ class AppWindow(QMainWindow):
         else:
             self._notify("Stitching Failed ❌", result_msg[:120], QSystemTrayIcon.Critical)
 
+    def _on_bulk_job_started(self, thread, topic, scenes):
+        """Called when StoryboardTab starts a BulkGenerationThread — register it in the Jobs tab."""
+        self._active_threads.append(thread)
+        self.jobs_tab.add_job(thread, topic, scenes)
+        self._update_jobs_tab_label()
+        # Remove from active list and update label when this job finishes
+        thread.all_done.connect(
+            lambda ok, msg, t=thread: self._on_any_bulk_job_done(t),
+            Qt.QueuedConnection,
+        )
+
+    def _on_any_bulk_job_done(self, thread):
+        if thread in self._active_threads:
+            self._active_threads.remove(thread)
+        self._update_jobs_tab_label()
+        self._notify("Generation Done ✅", "A background job finished. Check the Jobs tab.")
+
+    def _update_jobs_tab_label(self):
+        self._active_threads = [t for t in self._active_threads if t.isRunning()]
+        running = len(self._active_threads)
+        idx = self.tabs.indexOf(self.jobs_tab)
+        self.tabs.setTabText(idx, f"⏳ Jobs ({running})" if running else "⏳ Jobs")
+
+    def _on_load_job_in_storyboard(self, scenes, topic):
+        """Load a completed background job into the Storyboard tab."""
+        self.current_scenes = scenes
+        self.current_topic = topic
+        self.storyboard_tab.load_scenes(scenes, topic=topic)
+        self.export_tab.populate_thumbnails(scenes, self._current_video_path())
+        self.tabs.setCurrentIndex(1)
+
+    def _on_open_job_in_history(self, topic: str):
+        self.history_tab.load_history()
+        self.history_tab.select_topic(topic)
+        self.tabs.setCurrentIndex(3)
+
     def on_history_restitch(self, scenes, topic):
         """Triggered by History tab Re-Stitch button — runs stitch in background, reports back inline."""
         safe_topic = make_safe_topic(topic)
@@ -3133,18 +3673,16 @@ class AppWindow(QMainWindow):
         out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
 
         self._history_stitch_thread = VideoStitchingThread(scenes, out_path)
-        self._history_stitch_thread.progress_msg.connect(
-            lambda msg: self.history_tab.update_restitch_progress(
-                self.history_tab.restitch_progress.value(), msg
-            )
-        )
-        self._history_stitch_thread.progress_pct.connect(
-            lambda pct: self.history_tab.update_restitch_progress(pct, self.history_tab.restitch_status.text())
-        )
         self._history_stitch_thread.finished.connect(self.on_history_restitch_done)
+        self._active_threads.append(self._history_stitch_thread)
+        self.jobs_tab.add_stitch_job(self._history_stitch_thread, topic)
+        self._update_jobs_tab_label()
+        self._history_stitch_thread.finished.connect(
+            lambda ok, msg, t=self._history_stitch_thread: self._on_any_bulk_job_done(t),
+            Qt.QueuedConnection,
+        )
         self._history_stitch_thread.start()
-
-        self._notify("Re-Stitching Started ⏳", f'Building video for "{topic}" in the background.', duration_ms=3000)
+        self.tabs.setCurrentWidget(self.jobs_tab)
 
     def on_history_restitch_done(self, success, result_msg):
         self.history_tab.finish_restitch(success, result_msg)
@@ -3169,19 +3707,22 @@ QLabel.h2 {
 }
 
 QTabWidget::pane {
-    border: 1px solid #313244;
+    border: 1px solid #1e1e2e;
     border-radius: 8px;
     background-color: #1e1e2e;
 }
 
+QTabBar {
+    background: #1e1e2e;
+}
 QTabBar::tab {
     background: #181825;
     color: #a6adc8;
-    padding: 12px 32px;
-    min-width: 130px;
+    padding: 5px 10px;
+    min-width: 115px;
     border-top-left-radius: 8px;
     border-top-right-radius: 8px;
-    margin-right: 4px;
+    margin-right: 2px;
     font-weight: bold;
     border: 1px solid transparent;
 }
@@ -3209,12 +3750,32 @@ QLineEdit:focus, QTextEdit:focus {
     border: 1px solid #89b4fa;
 }
 
+QSpinBox {
+    background-color: #11111b;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: #cdd6f4;
+    min-width: 56px;
+}
+QSpinBox:focus {
+    border: 1px solid #89b4fa;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 14px;
+    background: #313244;
+    border: none;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+    background: #45475a;
+}
+
 QPushButton {
     background-color: #313244;
     color: #cdd6f4;
     border: none;
     border-radius: 6px;
-    padding: 10px 18px;
+    padding: 4px 8px;
     font-weight: 500;
 }
 
@@ -3307,7 +3868,7 @@ QPushButton[class="scene-button"] {
     background-color: #313244;
     color: #cdd6f4;
     font-weight: bold;
-    padding: 6px 8px;
+    padding: 4px 6px;
 }
 QPushButton[class="scene-button"]:hover {
     background-color: #45475a;
