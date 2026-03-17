@@ -3802,7 +3802,7 @@ class BackgroundJobsTab(QWidget):
 class AppWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Infographic Video Generator")
+        self.setWindowTitle("Infographic Video Generator  v1.3.0")
         self.resize(1530, 825)
 
         _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
