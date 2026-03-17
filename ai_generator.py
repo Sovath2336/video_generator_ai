@@ -136,7 +136,7 @@ def correct_topic_title(topic: str) -> str:
     return topic
 
 
-def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_search: bool = False):
+def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_search: bool = False, part_info: dict | None = None, ignore_number: bool = False):
     """
     Uses Gemini 2.5 Pro to generate a structured infographic script from a user-provided topic.
     When use_web_search=True, activates Gemini's native Google Search grounding so it
@@ -161,12 +161,22 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
         # lock the scene count to match: 1 title card + N main content + 1 CTA outro.
         _topic_number_match = re.search(r'\b(\d+)\b', topic)
         _topic_number = None
-        if _topic_number_match:
+        if not ignore_number and _topic_number_match:
             n = int(_topic_number_match.group(1))
             if 2 <= n <= 20:
                 _topic_number = n
                 estimated_scenes_min = estimated_scenes_max = n + 2
                 logger.info("Topic number detected: %d → forcing %d scenes total.", n, n + 2)
+
+        if part_info is not None:
+            _topic_number = part_info['items_per_part']
+            estimated_scenes_min = estimated_scenes_max = _topic_number + 2
+            logger.info(
+                "Part generation: Part %d of %d, items %d-%d, forcing %d scenes.",
+                part_info['current'], part_info['total'],
+                part_info['item_start'], part_info['item_end'],
+                _topic_number + 2,
+            )
 
         words_per_scene = int((duration_minutes * 140) / ((estimated_scenes_min + estimated_scenes_max) / 2))
         logger.info("Script plan: %d-%d scenes, ~%d words/scene",
@@ -179,7 +189,27 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
             if use_web_search else
             "Use your own extensive knowledge to write accurate content."
         )
-        
+
+        if ignore_number:
+            web_note += (
+                "\n\nIMPORTANT: The topic title may contain a number but you must NOT try to cover every "
+                "individual item in a separate scene. Summarize and group related items to fit all content "
+                "within the target duration. Prioritise depth and narrative flow over exhaustive enumeration."
+            )
+
+        _part_note = ""
+        if part_info is not None:
+            _part_note = (
+                f"\n\nSERIES CONTEXT: This script is Part {part_info['current']} of {part_info['total']} "
+                f"in a multi-part series about \"{part_info['base_topic']}\".\n"
+                f"Cover ONLY items {part_info['item_start']} through {part_info['item_end']} "
+                f"(out of {part_info['topic_number']} total). Do NOT cover items outside this range.\n"
+                f"The title card (Scene 1) visual prompt must mention that this is "
+                f"Part {part_info['current']} of {part_info['total']}.\n"
+                f"Each of the {_topic_number} main content scenes must cover exactly ONE item "
+                f"from items {part_info['item_start']}–{part_info['item_end']}."
+            )
+
         cta_visual = _cta_visual_instruction()
 
         _scenes_instruction = (
@@ -191,7 +221,7 @@ def generate_script_from_topic(topic: str, duration_minutes: int = 5, use_web_se
         )
 
         prompt = f"""You are an expert YouTube infographic video scriptwriter with a talent for cinematic storytelling and audience retention.
-{web_note}
+{web_note}{_part_note}
 
 Write a complete, YouTube-ready infographic video script about: "{topic}"
 
@@ -251,10 +281,10 @@ CRITICAL:
         else:
             logger.info("Web search grounding: OFF — using Gemini knowledge only.")
 
-        logger.info("Calling gemini-2.5-pro (streaming)...")
+        logger.info("Calling gemini-3-flash-preview (streaming)...")
         chunk_count = 0
         response = client.models.generate_content_stream(
-            model='gemini-2.5-pro',
+            model='gemini-3-flash-preview',
             contents=prompt,
             config=config,
         )
@@ -367,10 +397,11 @@ def _is_cta_image_prompt(prompt: str) -> bool:
     return sum(1 for marker in cta_markers if marker in text) >= 2
 
 
-def _shared_cta_image_path() -> str:
+def _shared_cta_image_path(mobile_friendly: bool = False) -> str:
     assets_dir = os.path.join(_ai_app_data_dir(), "assets", "Outro Image")
     os.makedirs(assets_dir, exist_ok=True)
-    return os.path.join(assets_dir, "cta_scene.jpg")
+    suffix = "portrait" if mobile_friendly else "landscape"
+    return os.path.join(assets_dir, f"cta_scene_{suffix}.jpg")
 
 
 def _cta_visual_instruction() -> str:
@@ -390,11 +421,16 @@ def _is_title_card_prompt(prompt: str) -> bool:
     return "title card" in text or "topic title" in text
 
 
-def _build_image_prompt(prompt: str, image_text: str | None = None, narration: str | None = None, force_title_card: bool = False) -> str:
-    base_prompt = f"Generate an image with 16:9 aspect ratio of: {prompt}"
+def _build_image_prompt(prompt: str, image_text: str | None = None, narration: str | None = None, force_title_card: bool = False, mobile_friendly: bool = True) -> str:
+    aspect = "9:16" if mobile_friendly else "16:9"
+    base_prompt = f"Generate an image with {aspect} aspect ratio of: {prompt}"
     image_text = _normalize_image_text(image_text)
     narration = re.sub(r"\s+", " ", (narration or "")).strip()
     if (force_title_card or _is_title_card_prompt(prompt)) and image_text:
+        clean = re.sub(r'[Ii]n the cent(?:er|re),?\s+the (?:exact )?text\s+["\'].*?["\'][^.]*\.?', '', prompt)
+        clean = re.sub(r'[Tt]he (?:exact )?text\s+["\'].*?["\'][^.]*\.?', '', clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        base_prompt = f"Generate an image with {aspect} aspect ratio of: {clean}"
         return (
             f"{base_prompt}\n\n"
             f'Important: the ONLY text that may appear anywhere in this image is the exact title: "{image_text}". '
@@ -419,7 +455,7 @@ def _build_image_prompt(prompt: str, image_text: str | None = None, narration: s
 
 _VALID_IMAGE_SIZES = {"512", "1K", "2K", "4K"}
 
-def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str | None = None, narration: str | None = None, is_title_card: bool = False) -> bool:
+def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str | None = None, narration: str | None = None, is_title_card: bool = False, mobile_friendly: bool = True) -> bool:
     """
     Uses Imagen 3 via the Gemini API to generate an image and save it to output_path.
     `overlay_text` is only used for intro title-card scenes. Other scenes stay text-free.
@@ -429,7 +465,7 @@ def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str 
     """
     scene_label = os.path.basename(output_path)
     if _is_cta_image_prompt(prompt):
-        shared_cta_path = _shared_cta_image_path()
+        shared_cta_path = _shared_cta_image_path(mobile_friendly)
         try:
             if os.path.exists(shared_cta_path) and os.path.getsize(shared_cta_path) > 0:
                 logger.info("[%s] CTA image: reusing cached outro image.", scene_label)
@@ -463,11 +499,11 @@ def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str 
             try:
                 result = client.models.generate_content(
                     model='gemini-3.1-flash-image-preview',
-                    contents=_build_image_prompt(prompt, overlay_text, narration, force_title_card=is_title_card),
+                    contents=_build_image_prompt(prompt, overlay_text, narration, force_title_card=is_title_card, mobile_friendly=mobile_friendly),
                     config=genai_types.GenerateContentConfig(
                         response_modalities=['TEXT', 'IMAGE'],
                         image_config=genai_types.ImageConfig(
-                            aspect_ratio='16:9',
+                            aspect_ratio='9:16' if mobile_friendly else '16:9',
                             image_size=image_size,
                         ),
                     ),
@@ -496,7 +532,7 @@ def generate_image_from_prompt(prompt: str, output_path: str, overlay_text: str 
                     logger.info("[%s] Image saved — %d bytes -> %s", scene_label, byte_size, output_path)
                     if _is_cta_image_prompt(prompt):
                         try:
-                            shutil.copy2(output_path, _shared_cta_image_path())
+                            shutil.copy2(output_path, _shared_cta_image_path(mobile_friendly))
                         except Exception as e:
                             logger.warning("CTA cache save failed: %s", e)
                     return True

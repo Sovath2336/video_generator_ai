@@ -21,3 +21,4 @@
 - Gemini TTS can return either `audio/l16` or `audio/pcm` mime types for raw PCM audio.
 - The project is on Windows 10; PowerShell is the shell.
 - Cursor's shell cannot spawn torch-based Python subprocesses reliably on Windows — always defer to user's own terminal for such tasks.
+- User is in Cambodia; store and display timestamps in Cambodia time (UTC+7).

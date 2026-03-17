@@ -30,7 +30,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QPushButton, QHBoxLayout, QLineEdit, QMessageBox, QFrame,
     QScrollArea, QProgressBar, QSpinBox, QSplitter, QListWidget, QListWidgetItem,
-    QTextBrowser, QCheckBox, QGridLayout, QSystemTrayIcon, QComboBox, QDialog, QSlider
+    QTextBrowser, QCheckBox, QGridLayout, QSystemTrayIcon, QComboBox, QDialog, QSlider,
+    QFileDialog
 )
 from PyQt5.QtGui import QPixmap, QIcon, QPainter, QPen, QColor, QFont
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QUrl, QRectF, QEvent
@@ -88,6 +89,11 @@ def parse_tts_selection(combo_text: str):
 
 def _app_data_dir() -> str:
     return _get_app_data_base()
+
+def _get_video_output_folder() -> str:
+    """Returns the saved video output folder, or '' if not set / no longer exists."""
+    folder = os.getenv("VIDEO_OUTPUT_FOLDER", "").strip()
+    return folder if folder and os.path.isdir(folder) else ""
 
 def make_safe_topic(topic: str) -> str:
     """Returns a filesystem-safe folder/file name derived from the topic."""
@@ -160,13 +166,14 @@ def make_scene_overlay_text(narration: str, visual: str = "") -> str:
 class ImageGenerationThread(QThread):
     generation_done = pyqtSignal(bool, str)
 
-    def __init__(self, prompt, output_path, overlay_text="", narration="", is_title_card=False):
+    def __init__(self, prompt, output_path, overlay_text="", narration="", is_title_card=False, mobile_friendly=True):
         super().__init__()
         self.prompt = prompt
         self.output_path = output_path
         self.overlay_text = overlay_text
         self.narration = narration
         self.is_title_card = is_title_card
+        self.mobile_friendly = mobile_friendly
 
     def run(self):
         success = generate_image_from_prompt(
@@ -175,6 +182,7 @@ class ImageGenerationThread(QThread):
             self.overlay_text,
             self.narration,
             self.is_title_card,
+            self.mobile_friendly,
         )
         self.generation_done.emit(success, self.output_path)
 
@@ -207,7 +215,7 @@ class BulkGenerationThread(QThread):
     scene_progress = pyqtSignal(int, str, str)
     all_done = pyqtSignal(bool, str)
 
-    def __init__(self, scenes, topic_folder, tts_engine="gemini", tts_voice=None, skip_existing=False, topic=""):
+    def __init__(self, scenes, topic_folder, tts_engine="gemini", tts_voice=None, skip_existing=False, topic="", mobile_friendly=True):
         super().__init__()
         self.scenes = scenes
         self.topic_folder = topic_folder  # absolute path to topic sub-folder
@@ -215,6 +223,7 @@ class BulkGenerationThread(QThread):
         self.tts_voice = tts_voice
         self.skip_existing = skip_existing
         self.topic = topic
+        self.mobile_friendly = mobile_friendly
         self.is_cancelled = False
 
     def cancel(self):
@@ -294,6 +303,7 @@ class BulkGenerationThread(QThread):
                         overlay,
                         scene.get('narration', ''),
                         is_title_card,
+                        self.mobile_friendly,
                     )
                 except BaseException as e:
                     logger.exception("Scene %d image generation raised: %s", idx, e)
@@ -396,10 +406,15 @@ class VideoStitchingThread(QThread):
     SAMPLE_RATE = 44100  # normalise all audio to this rate
     MAX_ZOOM = 1.08
 
-    def __init__(self, scenes, output_path):
+    def __init__(self, scenes, output_path, mobile_friendly=True):
         super().__init__()
         self.scenes = scenes
         self.output_path = output_path
+        self.mobile_friendly = mobile_friendly
+        if mobile_friendly:
+            self._out_w, self._out_h = 1080, 1920
+        else:
+            self._out_w, self._out_h = self.OUTPUT_W, self.OUTPUT_H
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -446,8 +461,9 @@ class VideoStitchingThread(QThread):
     }
 
     @staticmethod
-    def _sentence_word_spans(narration: str) -> list:
-        max_w = VideoStitchingThread._SUBTITLE_MAX_WORDS
+    def _sentence_word_spans(narration: str, max_w: int = None) -> list:
+        if max_w is None:
+            max_w = VideoStitchingThread._SUBTITLE_MAX_WORDS
         break_words = VideoStitchingThread._BREAK_WORDS
         sentence_re = re.compile(r'[^.!?,;]+[.!?,;]*', re.UNICODE)
         word_re = re.compile(r"[A-Za-z0-9]+(?:[\x27'][A-Za-z0-9]+)*", re.UNICODE)
@@ -480,11 +496,11 @@ class VideoStitchingThread(QThread):
         return spans
 
     @staticmethod
-    def _fallback_subtitle_chunks(narration: str, duration: float) -> list:
+    def _fallback_subtitle_chunks(narration: str, duration: float, max_w: int = None) -> list:
         narration = (narration or "").strip()
         if not narration or duration <= 0:
             return []
-        spans = VideoStitchingThread._sentence_word_spans(narration)
+        spans = VideoStitchingThread._sentence_word_spans(narration, max_w)
         if not spans:
             return [{"text": narration, "start_sec": 0.0, "end_sec": duration}]
         texts = [narration[s:e].strip() for s, e in spans if narration[s:e].strip()]
@@ -501,17 +517,17 @@ class VideoStitchingThread(QThread):
         ])
 
     @staticmethod
-    def _subtitle_chunks(narration: str, word_timings: list, duration: float) -> list:
+    def _subtitle_chunks(narration: str, word_timings: list, duration: float, max_w: int = None) -> list:
         narration = narration or ""
         if not narration.strip():
             return []
         if not word_timings:
-            return VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+            return VideoStitchingThread._fallback_subtitle_chunks(narration, duration, max_w)
         word_re = re.compile(r"[A-Za-z0-9]+(?:[\x27’][A-Za-z0-9]+)*", re.UNICODE)
         word_matches = list(word_re.finditer(narration))
-        spans = VideoStitchingThread._sentence_word_spans(narration)
+        spans = VideoStitchingThread._sentence_word_spans(narration, max_w)
         if not spans:
-            return VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+            return VideoStitchingThread._fallback_subtitle_chunks(narration, duration, max_w)
         if len(word_matches) != len(word_timings):
             chunks = []
             for span_idx, (s, e) in enumerate(spans):
@@ -535,7 +551,7 @@ class VideoStitchingThread(QThread):
                 else:
                     end_sec = duration
                 chunks.append({"text": span_text, "start_sec": start_sec, "end_sec": end_sec})
-            return chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+            return chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration, max_w)
         chunks = []
         for span_idx, (s, e) in enumerate(spans):
             span_text = narration[s:e].strip()
@@ -557,7 +573,7 @@ class VideoStitchingThread(QThread):
                 end_sec = duration
             chunks.append({"text": span_text, "start_sec": start_sec, "end_sec": end_sec})
         return VideoStitchingThread._fix_quote_marks(
-            chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration)
+            chunks or VideoStitchingThread._fallback_subtitle_chunks(narration, duration, max_w)
         )
 
     @staticmethod
@@ -583,7 +599,7 @@ class VideoStitchingThread(QThread):
         return chunks
 
     @classmethod
-    def _subtitle_vf(cls, narration: str, word_timings: list, duration: float, subtitle_dir: str, scene_idx: int) -> str:
+    def _subtitle_vf(cls, narration: str, word_timings: list, duration: float, subtitle_dir: str, scene_idx: int, out_w: int = 1920) -> str:
         """
         Build chained ffmpeg drawtext filters from aligned word timings.
         Each subtitle group shows at most 10 words and advances using the
@@ -592,10 +608,15 @@ class VideoStitchingThread(QThread):
         if not narration.strip() or duration <= 0:
             return ""
 
+        is_portrait = out_w <= 1080
+        fontsize = 30 if is_portrait else 42
+        max_words = 5 if is_portrait else None
+        y_offset = 180 if is_portrait else 80
+
         os.makedirs(subtitle_dir, exist_ok=True)
-        chunks = cls._subtitle_chunks(narration, word_timings, duration)
+        chunks = cls._subtitle_chunks(narration, word_timings, duration, max_words)
         if not chunks:
-            chunks = cls._fallback_subtitle_chunks(narration, duration)
+            chunks = cls._fallback_subtitle_chunks(narration, duration, max_words)
         if not chunks:
             return ""
         font_path = cls._find_subtitle_font()
@@ -624,16 +645,17 @@ class VideoStitchingThread(QThread):
                 drawtext_parts.append(f"fontfile='{cls._escape_drawtext_path(font_path)}':")
             filters.append(
                 "".join(drawtext_parts)
-                + f"fontsize=42:"
+                + f"fontsize={fontsize}:"
                 f"fontcolor=white:"
                 f"x=(w-text_w)/2:"
-                f"y=h-text_h-80:"
+                f"y=h-text_h-{y_offset}:"
                 f"line_spacing=8:"
                 f"borderw=3:"
                 f"bordercolor=0x000000E0:"
                 f"box=1:"
                 f"boxcolor=0x000000C8:"
                 f"boxborderw=28:"
+                f"fix_bounds=1:"
                 f"enable='{cls._escape_drawtext_value(enable_expr)}'"
             )
 
@@ -662,23 +684,66 @@ class VideoStitchingThread(QThread):
             )
         else:
             zoom_expr = f"1+{zoom_delta:.4f}*(t/{safe_duration:.4f})"
-        return [
-            f"scale={self.OUTPUT_W}:{self.OUTPUT_H}:force_original_aspect_ratio=decrease",
-            f"pad={self.OUTPUT_W}:{self.OUTPUT_H}:(ow-iw)/2:(oh-ih)/2",
+        is_portrait = self._out_w < self._out_h
+        if is_portrait:
+            base = [
+                f"scale={self._out_w}:-2",
+                f"pad={self._out_w}:max({self._out_h}\\,ih):0:(oh-ih)/2",
+                f"crop={self._out_w}:{self._out_h}:0:(ih-{self._out_h})/2:exact=1",
+            ]
+        else:
+            base = [
+                f"scale={self._out_w}:{self._out_h}:force_original_aspect_ratio=decrease",
+                f"pad={self._out_w}:{self._out_h}:(ow-iw)/2:(oh-ih)/2",
+            ]
+        return base + [
             f"scale=w='iw*({zoom_expr})':h='ih*({zoom_expr})':eval=frame",
-            f"crop={self.OUTPUT_W}:{self.OUTPUT_H}:(iw-{self.OUTPUT_W})/2:(ih-{self.OUTPUT_H})/2:exact=1",
+            f"crop={self._out_w}:{self._out_h}:(iw-{self._out_w})/2:(ih-{self._out_h})/2:exact=1",
             "setsar=1",
         ]
 
     def _freeze_motion_filters(self) -> list:
-        """Hold the final zoom level steady during the pause clip."""
-        return [
-            f"scale={self.OUTPUT_W}:{self.OUTPUT_H}:force_original_aspect_ratio=decrease",
-            f"pad={self.OUTPUT_W}:{self.OUTPUT_H}:(ow-iw)/2:(oh-ih)/2",
-            f"scale={int(round(self.OUTPUT_W * self.MAX_ZOOM))}:{int(round(self.OUTPUT_H * self.MAX_ZOOM))}",
-            f"crop={self.OUTPUT_W}:{self.OUTPUT_H}:(iw-{self.OUTPUT_W})/2:(ih-{self.OUTPUT_H})/2:exact=1",
+        is_portrait = self._out_w < self._out_h
+        if is_portrait:
+            base = [
+                f"scale={self._out_w}:-2",
+                f"pad={self._out_w}:max({self._out_h}\\,ih):0:(oh-ih)/2",
+                f"crop={self._out_w}:{self._out_h}:0:(ih-{self._out_h})/2:exact=1",
+            ]
+        else:
+            base = [
+                f"scale={self._out_w}:{self._out_h}:force_original_aspect_ratio=decrease",
+                f"pad={self._out_w}:{self._out_h}:(ow-iw)/2:(oh-ih)/2",
+            ]
+        return base + [
+            f"scale={int(round(self._out_w * self.MAX_ZOOM))}:{int(round(self._out_h * self.MAX_ZOOM))}",
+            f"crop={self._out_w}:{self._out_h}:(iw-{self._out_w})/2:(ih-{self._out_h})/2:exact=1",
             "setsar=1",
         ]
+
+    def _probe_image_dimensions(self, ffmpeg_path: str, img_path: str) -> tuple:
+        """Return (width, height) of an image file via ffprobe. Falls back to OUTPUT_W/H."""
+        ffprobe = os.path.join(
+            os.path.dirname(ffmpeg_path),
+            "ffprobe" + (".exe" if os.name == "nt" else ""),
+        )
+        if not os.path.exists(ffprobe):
+            ffprobe = "ffprobe"
+        try:
+            _no_win = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "csv=s=x:p=0", img_path],
+                capture_output=True, text=True, timeout=10,
+                **_no_win,
+            )
+            parts = r.stdout.strip().split("x")
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+        return self.OUTPUT_W, self.OUTPUT_H
 
     def _probe_duration(self, ffmpeg_path: str, media_path: str) -> float:
         """Return media duration in seconds via ffprobe, falling back to moviepy."""
@@ -788,6 +853,7 @@ class VideoStitchingThread(QThread):
         threads = str(os.cpu_count() or 4)
         fade_d = 0.5  # seconds of fade-in/out baked into every clip
 
+
         clip_paths: list = []
         subtitle_dir = os.path.join(temp_dir, "subtitles")
 
@@ -829,7 +895,7 @@ class VideoStitchingThread(QThread):
                     self.finished.emit(False, f"Scene {i+1} subtitle alignment failed.")
                     return
 
-            subtitle_vf = self._subtitle_vf(narration, word_timings, dur, subtitle_dir, i)
+            subtitle_vf = self._subtitle_vf(narration, word_timings, dur, subtitle_dir, i, out_w=self._out_w)
             scene_filters = self._scene_motion_filters(dur, self.PAUSE_DURATION)
             if subtitle_vf:
                 scene_filters.append(subtitle_vf)
@@ -939,14 +1005,16 @@ class ScriptGenerationThread(QThread):
     chunk_received = pyqtSignal(str)
     finished = pyqtSignal()
     
-    def __init__(self, topic, duration, use_web_search=False):
+    def __init__(self, topic, duration, use_web_search=False, part_info=None, ignore_number=False):
         super().__init__()
         self.topic = topic
         self.duration = duration
         self.use_web_search = use_web_search
-        
+        self.part_info = part_info
+        self.ignore_number = ignore_number
+
     def run(self):
-        for chunk in generate_script_from_topic(self.topic, self.duration, self.use_web_search):
+        for chunk in generate_script_from_topic(self.topic, self.duration, self.use_web_search, self.part_info, self.ignore_number):
             self.chunk_received.emit(chunk)
         self.finished.emit()
 
@@ -1046,9 +1114,12 @@ class SpinnerOverlay(QWidget):
 class ScriptTab(QWidget):
     next_requested = pyqtSignal(list)
     next_requested_topic = pyqtSignal(str)
+    next_requested_part_label = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
+        self._part_info = None   # set when generating parts
+        self._part_label = ''    # e.g. "Part 1 of 7"
         root = QVBoxLayout()
         root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(0)
@@ -1117,6 +1188,11 @@ class ScriptTab(QWidget):
         self.next_btn.setProperty("class", "success-button")
         self.next_btn.clicked.connect(self.parse_and_go_next)
         btn_layout.addWidget(self.next_btn)
+        self._next_part_btn = QPushButton("▶ Generate Part 2")
+        self._next_part_btn.setProperty("class", "success-button")
+        self._next_part_btn.hide()
+        self._next_part_btn.clicked.connect(self._generate_next_part)
+        btn_layout.addWidget(self._next_part_btn)
         draft_layout.addLayout(btn_layout)
 
         self._script_tabs.addTab(draft_widget, "Generate with Gemini")
@@ -1191,10 +1267,12 @@ class ScriptTab(QWidget):
         # Save to Local SQLite Cache
         topic = self.topic_input.text().strip() or "Custom Script"
         duration = self.duration_spin.value()
-        db.save_script_and_scenes(topic, duration, text, scenes)
+        db_topic = f"{topic} — {self._part_label}" if self._part_label else topic
+        db.save_script_and_scenes(db_topic, duration, text, scenes)
 
         self.next_requested.emit(scenes)
-        self.next_requested_topic.emit(topic)
+        self.next_requested_topic.emit(db_topic)
+        self.next_requested_part_label.emit(self._part_label)
 
     def generate_script(self):
         topic = self.topic_input.text().strip()
@@ -1216,22 +1294,19 @@ class ScriptTab(QWidget):
         self._correction_thread.start()
 
     def _on_topic_corrected(self, corrected_topic: str):
-        # Update the input field with the corrected title so the user can see it.
         self.topic_input.setText(corrected_topic)
-
         duration = self.duration_spin.value()
         use_web = self.web_search_chk.isChecked()
 
-        if use_web:
-            self.generate_btn.setText("🌐 Searching & Generating...")
-        else:
-            self.generate_btn.setText("⏳ Generating...")
+        # Check if topic number overflows the duration
+        overflow = self._detect_overflow(corrected_topic, duration)
+        if overflow:
+            self._show_overflow_dialog(corrected_topic, duration, use_web, overflow)
+            return
 
-        # Step 2: generate the script with the corrected topic.
-        self.thread = ScriptGenerationThread(corrected_topic, duration, use_web)
-        self.thread.chunk_received.connect(self.on_chunk_received)
-        self.thread.finished.connect(self.on_script_generated)
-        self.thread.start()
+        self._part_info = None
+        self._part_label = ''
+        self._start_generation(corrected_topic, duration, use_web)
 
     def analyze_text(self):
         source_text = self.analyze_input.toPlainText().strip()
@@ -1264,10 +1339,17 @@ class ScriptTab(QWidget):
         self.script_editor.setTextCursor(cursor)
 
     def on_script_generated(self):
-        self._spinner.stop()          # failsafe – hide if no chunks arrived
+        self._spinner.stop()
         self._waiting_for_first_chunk = False
         self.generate_btn.setEnabled(True)
         self.generate_btn.setText("✨ Generate Script")
+        # Show "next part" button if there are more parts to generate
+        if self._part_info and self._part_info['current'] < self._part_info['total']:
+            next_part = self._part_info['current'] + 1
+            self._next_part_btn.setText(f"▶ Generate Part {next_part} of {self._part_info['total']}")
+            self._next_part_btn.show()
+        else:
+            self._next_part_btn.hide()
 
     def on_analyze_done(self):
         self._spinner.stop()
@@ -1277,6 +1359,154 @@ class ScriptTab(QWidget):
         self.analyze_status.setText("✅ Done! Switch to Draft tab to review, then click Next.")
         self.analyze_status.setStyleSheet("color: #a6e3a1;")
         self._script_tabs.setCurrentIndex(0)
+
+    def _detect_overflow(self, topic: str, duration: int):
+        """
+        Returns a dict if the topic's item count overflows the duration, else None.
+        Dict keys: topic_number, items_per_part, total_parts, needed_duration
+        """
+        import math
+        m = re.search(r'\b(\d+)\b', topic)
+        if not m:
+            return None
+        n = int(m.group(1))
+        if not (2 <= n <= 200):
+            return None
+        MIN_WORDS_PER_SCENE = 80
+        content_words = max(1, duration * 140 - 25)  # minus short intro+CTA
+        max_items = max(1, int(content_words / MIN_WORDS_PER_SCENE))
+        if n <= max_items:
+            return None
+        items_per_part = max_items
+        total_parts = math.ceil(n / items_per_part)
+        needed_duration = math.ceil((n * MIN_WORDS_PER_SCENE + 25) / 140)
+        return {
+            'topic_number': n,
+            'items_per_part': items_per_part,
+            'total_parts': total_parts,
+            'needed_duration': needed_duration,
+        }
+
+    def _show_overflow_dialog(self, topic: str, duration: int, use_web: bool, overflow: dict):
+        import math
+        n = overflow['topic_number']
+        total_parts = overflow['total_parts']
+        items_per_part = overflow['items_per_part']
+        needed = overflow['needed_duration']
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Content Overflow Detected")
+        dlg.setMinimumWidth(480)
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(14)
+
+        info = QLabel(
+            f"<b>\"{topic}\"</b> has <b>{n} items</b>, but a <b>{duration}-minute</b> video "
+            f"can only fit about <b>{items_per_part} items</b> with meaningful narration.<br><br>"
+            f"How would you like to proceed?"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        btn_extend = QPushButton(f"⏱️  Extend to {needed} min  (fit all {n} items in one video)")
+        btn_extend.setProperty("class", "primary-button")
+
+        btn_cram = QPushButton(f"📦  Cram into {duration} min  (AI will summarise & group items)")
+        btn_cram.setProperty("class", "secondary-button")
+
+        btn_parts = QPushButton(f"📚  Generate as {total_parts} parts  (~{items_per_part} items each, {duration} min/part)")
+        btn_parts.setProperty("class", "success-button")
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setProperty("class", "secondary-button")
+
+        layout.addWidget(btn_extend)
+        layout.addWidget(btn_cram)
+        layout.addWidget(btn_parts)
+        layout.addWidget(btn_cancel)
+
+        chosen = {'action': None}
+
+        def pick(action):
+            chosen['action'] = action
+            dlg.accept()
+
+        btn_extend.clicked.connect(lambda: pick('extend'))
+        btn_cram.clicked.connect(lambda: pick('cram'))
+        btn_parts.clicked.connect(lambda: pick('parts'))
+        btn_cancel.clicked.connect(dlg.reject)
+
+        if dlg.exec_() != QDialog.Accepted or chosen['action'] is None:
+            # Cancelled — re-enable generate button
+            self.generate_btn.setEnabled(True)
+            self.generate_btn.setText("✨ Generate Script")
+            self._spinner.stop()
+            return
+
+        action = chosen['action']
+
+        if action == 'extend':
+            self.duration_spin.setValue(needed)
+            self._part_info = None
+            self._part_label = ''
+            self._start_generation(topic, needed, use_web)
+
+        elif action == 'cram':
+            self._part_info = None
+            self._part_label = ''
+            self._start_generation(topic, duration, use_web, ignore_number=True)
+
+        else:  # parts
+            self._part_info = {
+                'current': 1,
+                'total': total_parts,
+                'items_per_part': items_per_part,
+                'item_start': 1,
+                'item_end': min(items_per_part, n),
+                'topic_number': n,
+                'base_topic': topic,
+            }
+            self._part_label = f"Part 1 of {total_parts}"
+            self._start_generation(topic, duration, use_web, part_info=self._part_info)
+
+    def _start_generation(self, topic: str, duration: int, use_web: bool, part_info=None, ignore_number=False):
+        if use_web:
+            self.generate_btn.setText("🌐 Searching & Generating...")
+        else:
+            self.generate_btn.setText("⏳ Generating...")
+        self.thread = ScriptGenerationThread(topic, duration, use_web, part_info, ignore_number)
+        self.thread.chunk_received.connect(self.on_chunk_received)
+        self.thread.finished.connect(self.on_script_generated)
+        self.thread.start()
+
+    def _generate_next_part(self):
+        if not self._part_info:
+            return
+        pi = self._part_info
+        next_part = pi['current'] + 1
+        if next_part > pi['total']:
+            return
+        item_start = (next_part - 1) * pi['items_per_part'] + 1
+        item_end = min(next_part * pi['items_per_part'], pi['topic_number'])
+        self._part_info = {
+            'current': next_part,
+            'total': pi['total'],
+            'items_per_part': pi['items_per_part'],
+            'item_start': item_start,
+            'item_end': item_end,
+            'topic_number': pi['topic_number'],
+            'base_topic': pi['base_topic'],
+        }
+        self._part_label = f"Part {next_part} of {pi['total']}"
+        self._next_part_btn.hide()
+        self.script_editor.clear()
+        self.generate_btn.setEnabled(False)
+        self.generate_btn.setText("⏳ Generating...")
+        self._waiting_for_first_chunk = True
+        self._spinner.start()
+        duration = self.duration_spin.value()
+        use_web = self.web_search_chk.isChecked()
+        self._start_generation(pi['base_topic'], duration, use_web, part_info=self._part_info)
 
     def eventFilter(self, obj, event):
         # Keep the spinner overlay filling the script editor as it resizes
@@ -1292,6 +1522,7 @@ class StoryboardTab(QWidget):
     def __init__(self):
         super().__init__()
         self._topic = ''
+        self._part_label = ''
         layout = QVBoxLayout()
         layout.setContentsMargins(20, 20, 20, 20)
 
@@ -1312,19 +1543,27 @@ class StoryboardTab(QWidget):
         
         self.generate_all_btn = QPushButton("⚡ Auto-Generate All Scenes")
         self.generate_all_btn.setProperty("class", "success-button")
-        
+
         self.stop_btn = QPushButton("⏹️ Stop")
         self.stop_btn.setProperty("class", "danger-button")
         self.stop_btn.hide()
-        
+
+        self.mobile_friendly_chk = QCheckBox("Mobile Friendly")
+        self.mobile_friendly_chk.setChecked(True)
+        self.mobile_friendly_chk.setToolTip("Checked: 9:16 portrait aspect ratio (mobile). Unchecked: 16:9 landscape aspect ratio.")
+
         header_layout.addWidget(label)
         header_layout.addStretch()
+        header_layout.addWidget(self.mobile_friendly_chk)
         header_layout.addWidget(QLabel("TTS Engine:"))
         header_layout.addWidget(self.tts_engine_combo)
         header_layout.addWidget(self.generate_all_btn)
         header_layout.addWidget(self.stop_btn)
         layout.addLayout(header_layout)
-        
+
+        self._preview_labels = {}  # id(QLabel) -> {'lbl': QLabel, 'has_image': bool}
+        self.mobile_friendly_chk.stateChanged.connect(self._on_mobile_friendly_changed)
+
         # Scroll Area for assets list
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1355,8 +1594,9 @@ class StoryboardTab(QWidget):
         layout.addLayout(nav_layout)
         self.setLayout(layout)
 
-    def load_scenes(self, scenes, topic=''):
+    def load_scenes(self, scenes, topic='', part_label=''):
         self._topic = topic
+        self._part_label = part_label
         self._topic_folder = os.path.join(
             _app_data_dir(), 'assets', make_safe_topic(topic)
         )
@@ -1367,6 +1607,8 @@ class StoryboardTab(QWidget):
             self.generate_all_btn.clicked.disconnect()
         except TypeError:
             pass
+
+        self._preview_labels = {}
 
         # Clear existing layout except the stretch
         while self.scroll_layout.count() > 1:
@@ -1417,7 +1659,9 @@ class StoryboardTab(QWidget):
             
             # Action Buttons & Status (Images)
             btn_layout_img = QHBoxLayout()
-            gen_img_btn = QPushButton("🖼️ Generate Image")
+            _existing_img_check = scene.get('img_path', '')
+            _img_exists = bool(_existing_img_check and os.path.exists(_existing_img_check))
+            gen_img_btn = QPushButton("🖼️ Re-Generate Image" if _img_exists else "🖼️ Generate Image")
             gen_img_btn.setProperty("class", "scene-button")
             view_img_btn = QPushButton("👁 View Image")
             view_img_btn.setProperty("class", "scene-button")
@@ -1434,16 +1678,17 @@ class StoryboardTab(QWidget):
 
             # Action Buttons & Status (Audio)
             btn_layout_aud = QHBoxLayout()
-            gen_aud_btn = QPushButton("🎙️ Generate Audio")
+            _existing_aud = scene.get('audio_path', '')
+            _aud_exists = bool(_existing_aud and os.path.exists(_existing_aud))
+            gen_aud_btn = QPushButton("🎙️ Re-Generate Audio" if _aud_exists else "🎙️ Generate Audio")
             gen_aud_btn.setProperty("class", "scene-button")
             play_aud_btn = QPushButton("▶ Play Audio")
             play_aud_btn.setProperty("class", "scene-button")
             play_aud_btn.hide()
-            
+
             status_lbl_aud = QLabel("")
             status_lbl_aud.setStyleSheet("color: #a6e3a1;")
-            _existing_aud = scene.get('audio_path', '')
-            if _existing_aud and os.path.exists(_existing_aud):
+            if _aud_exists:
                 play_aud_btn.show()
 
             btn_layout_aud.addWidget(gen_aud_btn)
@@ -1457,25 +1702,35 @@ class StoryboardTab(QWidget):
             img_preview = QLabel("Image\nPreview")
             img_preview.setAlignment(Qt.AlignCenter)
             img_preview.setStyleSheet("background: #181825; border-radius: 6px; color: #585b70;")
-            img_preview.setFixedSize(200, 112) # 16:9 aspect ratio forced
-            _existing_img = scene.get('img_path', '')
-            if _existing_img and os.path.exists(_existing_img):
-                _pix = QPixmap(_existing_img)
-                img_preview.setPixmap(_pix.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+            _ph_w, _ph_h = (112, 200) if self.mobile_friendly_chk.isChecked() else (200, 112)
+            img_preview.setFixedSize(_ph_w, _ph_h)
+            if _img_exists:
+                _pix = QPixmap(_existing_img_check)
+                _scaled = _pix.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                img_preview.setFixedSize(_scaled.width(), _scaled.height())
+                img_preview.setPixmap(_scaled)
                 view_img_btn.show()
-                view_img_btn.clicked.connect(lambda _, p=_existing_img: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
+                view_img_btn.clicked.connect(lambda _, p=_existing_img_check: os.startfile(os.path.abspath(p)) if os.name == 'nt' else None)
+            self._preview_labels[id(img_preview)] = {'lbl': img_preview, 'has_image': _img_exists}
             right_layout.addWidget(img_preview)
+            audio_icon_lbl = QLabel("🔊 Audio Ready")
+            audio_icon_lbl.setAlignment(Qt.AlignCenter)
+            audio_icon_lbl.setStyleSheet("color: #a6e3a1; font-size: 11px;")
+            audio_icon_lbl.setVisible(_aud_exists)
+            right_layout.addWidget(audio_icon_lbl)
             
             card_main_layout.addLayout(left_layout, stretch=3)
             card_main_layout.addLayout(right_layout, stretch=1)
             
             # Capture the scope for the handlers
             _is_title_card_scene = (i == 0)
-            _overlay = (
-                self._topic
-                if _is_title_card_scene and self._topic
-                else make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', ''))
-            )
+            if _is_title_card_scene and self._topic:
+                _title_overlay = self._topic
+                if self._part_label:
+                    _title_overlay = f"{self._topic}\n{self._part_label}"
+                _overlay = _title_overlay
+            else:
+                _overlay = make_scene_overlay_text(scene.get('narration', ''), scene.get('visual', ''))
 
             def create_img_handler(
                 idx=i,
@@ -1490,6 +1745,7 @@ class StoryboardTab(QWidget):
                 tdir=self._topic_folder,
                 title_card=_is_title_card_scene,
                 _file_key=scene.get('db_id') or (i + 1),
+                _mobile_chk=self.mobile_friendly_chk,
             ):
                 os.makedirs(tdir, exist_ok=True)
                 out_path = os.path.join(tdir, f"scene_{_file_key}.jpg")
@@ -1498,7 +1754,7 @@ class StoryboardTab(QWidget):
                 lbl.setStyleSheet("color: #f9e2af;") # Yellow
 
                 actual_prompt = prompt_edit.toPlainText().strip() if prompt_edit else prompt
-                thread = ImageGenerationThread(actual_prompt, out_path, overlay_text, narration, title_card)
+                thread = ImageGenerationThread(actual_prompt, out_path, overlay_text, narration, title_card, _mobile_chk.isChecked())
                 # Store reference so it is not garbage collected
                 setattr(self, f"img_thread_{idx}", thread)
                 
@@ -1508,8 +1764,14 @@ class StoryboardTab(QWidget):
                         if success:
                             lbl.setText("✅ Image Generated!")
                             lbl.setStyleSheet("color: #a6e3a1;")
+                            btn.setText("🖼️ Re-Generate Image")
                             pixmap = QPixmap(path)
-                            p_lbl.setPixmap(pixmap.scaled(200, 112, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                            _scaled = pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            p_lbl.setFixedSize(_scaled.width(), _scaled.height())
+                            p_lbl.setPixmap(_scaled)
+                            _key = id(p_lbl)
+                            if _key in self._preview_labels:
+                                self._preview_labels[_key]['has_image'] = True
                             scene['img_path'] = path
                             db.update_scene_asset(scene.get('db_id'), 'img_path', path)
                             view_btn.show()
@@ -1519,11 +1781,11 @@ class StoryboardTab(QWidget):
                             lbl.setStyleSheet("color: #f38ba8;")
                     except RuntimeError:
                         pass
-                        
+
                 thread.generation_done.connect(on_finish)
                 thread.start()
 
-            def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn, tdir=self._topic_folder):
+            def create_aud_handler(idx=i, text=scene['narration'], lbl=status_lbl_aud, btn=gen_aud_btn, play_btn=play_aud_btn, tdir=self._topic_folder, aud_icon=audio_icon_lbl):
                 os.makedirs(tdir, exist_ok=True)
                 engine, voice = parse_tts_selection(self.tts_engine_combo.currentText())
                 audio_ext = "wav" if engine == "gemini" else "mp3"
@@ -1541,6 +1803,8 @@ class StoryboardTab(QWidget):
                         if success:
                             lbl.setText("✅ Audio Saved.")
                             lbl.setStyleSheet("color: #a6e3a1;")
+                            btn.setText("🎙️ Re-Generate Audio")
+                            aud_icon.setVisible(True)
                             scene['audio_path'] = path
                             db.update_scene_asset(scene.get('db_id'), 'audio_path', path)
                             db.update_scene_asset(scene.get('db_id'), 'tts_voice', voice or '')
@@ -1552,7 +1816,7 @@ class StoryboardTab(QWidget):
                             lbl.setStyleSheet("color: #f38ba8;")
                     except RuntimeError:
                         pass
-                        
+
                 thread.generation_done.connect(on_finish)
                 thread.start()
                 
@@ -1608,7 +1872,7 @@ class StoryboardTab(QWidget):
             for j, (sc, lbl_img, lbl_aud, p_lbl, v_btn, pl_btn) in enumerate(scene_ui_refs):
                 status_map[j] = (lbl_img, lbl_aud, p_lbl, v_btn, pl_btn)
 
-            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine, voice, skip_existing, self._topic)
+            bulk_thread = BulkGenerationThread(scenes, self._topic_folder, engine, voice, skip_existing, self._topic, self.mobile_friendly_chk.isChecked())
             setattr(self, '_bulk_thread', bulk_thread)
             self.bulk_job_started.emit(bulk_thread, self._topic, scenes)
 
@@ -1675,6 +1939,16 @@ class StoryboardTab(QWidget):
             bulk_thread.start()
 
         self.generate_all_btn.clicked.connect(trigger_all)
+
+    def _on_mobile_friendly_changed(self):
+        """Resize placeholder previews (no image yet) to match the selected aspect ratio."""
+        ph_w, ph_h = (112, 200) if self.mobile_friendly_chk.isChecked() else (200, 112)
+        for entry in self._preview_labels.values():
+            if not entry['has_image']:
+                try:
+                    entry['lbl'].setFixedSize(ph_w, ph_h)
+                except RuntimeError:
+                    pass  # widget already deleted
 
 class ExportTab(QWidget):
     back_requested = pyqtSignal()
@@ -2079,8 +2353,12 @@ class HistoryTab(QWidget):
         self.history_stop_btn = QPushButton("⏹️ Stop")
         self.history_stop_btn.setProperty("class", "danger-button")
         self.history_stop_btn.hide()
+        self.history_mobile_friendly_chk = QCheckBox("Mobile Friendly")
+        self.history_mobile_friendly_chk.setChecked(True)
+        self.history_mobile_friendly_chk.setToolTip("Checked: 9:16 portrait aspect ratio (mobile). Unchecked: 16:9 landscape aspect ratio.")
         scene_ctrl_row.addWidget(self.history_tts_engine_combo)
         scene_ctrl_row.addStretch()
+        scene_ctrl_row.addWidget(self.history_mobile_friendly_chk)
         scene_ctrl_row.addWidget(self.history_generate_all_btn)
         scene_ctrl_row.addWidget(self.history_stop_btn)
         right_layout.addLayout(scene_ctrl_row)
@@ -2233,9 +2511,14 @@ class HistoryTab(QWidget):
             for (sid, order, visual, narration, img_path, audio_path, tts_voice) in scenes
         ]
 
-        # Check for a final video in the topic sub-folder
+        # Check for a final video — custom output folder first, then app-data fallback
         safe_topic = make_safe_topic(topic)
-        video_path = os.path.join(_app_data_dir(), 'assets', safe_topic, f"{safe_topic}.mp4")
+        _custom_folder = _get_video_output_folder()
+        _custom_path = os.path.join(_custom_folder, f"{safe_topic}.mp4") if _custom_folder else ""
+        video_path = (
+            _custom_path if _custom_path and os.path.exists(_custom_path)
+            else os.path.join(_app_data_dir(), 'assets', safe_topic, f"{safe_topic}.mp4")
+        )
         if os.path.exists(video_path):
             self._current_video_path = video_path
             self.video_lbl.setText(f"✅ {os.path.basename(video_path)}")
@@ -2245,12 +2528,21 @@ class HistoryTab(QWidget):
                 self.open_folder_btn.clicked.disconnect()
             except TypeError:
                 pass
-            self.view_video_btn.clicked.connect(
-                lambda: os.startfile(os.path.abspath(video_path))
-            )
-            self.open_folder_btn.clicked.connect(
-                lambda: os.startfile(os.path.abspath(os.path.dirname(video_path)))
-            )
+            def _open_video(p=video_path):
+                if not os.path.exists(p):
+                    QMessageBox.warning(self, "Video Not Found", f"Video file not found:\n{p}")
+                    return
+                os.startfile(os.path.abspath(p))
+
+            def _open_folder(p=video_path):
+                folder = os.path.abspath(os.path.dirname(p))
+                if not os.path.exists(folder):
+                    QMessageBox.warning(self, "Folder Not Found", f"Folder not found:\n{folder}")
+                    return
+                os.startfile(folder)
+
+            self.view_video_btn.clicked.connect(lambda *_: _open_video())
+            self.open_folder_btn.clicked.connect(lambda *_: _open_folder())
             self.view_video_btn.show()
             self.open_folder_btn.show()
             self.play_video_btn.hide()
@@ -2283,6 +2575,9 @@ class HistoryTab(QWidget):
             for s in self._current_scenes
         ) and bool(self._current_scenes)
         self.restitch_btn.setVisible(all_ready)
+        if all_ready:
+            has_video = bool(self._current_video_path and os.path.exists(self._current_video_path))
+            self.restitch_btn.setText("🔁 Re-Stitch" if has_video else "🎬 Stitch Video")
 
     def _render_history_scene_cards(self):
         while self.scenes_layout.count() > 1:
@@ -2308,7 +2603,8 @@ class HistoryTab(QWidget):
             text_block.addWidget(lbl_narr)
 
             img_row = QHBoxLayout()
-            gen_img_btn = QPushButton("🖼️ Generate Image")
+            _h_img_exists = bool(scene.get('img_path') and os.path.exists(scene['img_path']))
+            gen_img_btn = QPushButton("🖼️ Re-Generate Image" if _h_img_exists else "🖼️ Generate Image")
             gen_img_btn.setProperty("class", "scene-button")
             view_img_btn = QPushButton("👁 View Image")
             view_img_btn.setProperty("class", "scene-button")
@@ -2322,7 +2618,8 @@ class HistoryTab(QWidget):
             text_block.addLayout(img_row)
 
             aud_row = QHBoxLayout()
-            gen_aud_btn = QPushButton("🎙️ Generate Audio")
+            _h_aud_exists = bool(scene.get('audio_path') and os.path.exists(scene['audio_path']))
+            gen_aud_btn = QPushButton("🎙️ Re-Generate Audio" if _h_aud_exists else "🎙️ Generate Audio")
             gen_aud_btn.setProperty("class", "scene-button")
             play_aud_btn = QPushButton("▶ Play Audio")
             play_aud_btn.setProperty("class", "scene-button")
@@ -2335,13 +2632,17 @@ class HistoryTab(QWidget):
             aud_row.addStretch()
             text_block.addLayout(aud_row)
 
+            right_col = QVBoxLayout()
+            right_col.setSpacing(4)
             thumb = QLabel()
-            thumb.setFixedSize(142, 80)
+            thumb.setFixedSize(142, 80)  # default placeholder size
             thumb.setAlignment(Qt.AlignCenter)
             thumb.hide()
             if scene.get('img_path') and os.path.exists(scene['img_path']):
                 pix = QPixmap(scene['img_path'])
-                thumb.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                _scaled = pix.scaled(142, 142, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb.setFixedSize(_scaled.width(), _scaled.height())
+                thumb.setPixmap(_scaled)
                 thumb.show()
                 view_img_btn.show()
                 try:
@@ -2353,8 +2654,14 @@ class HistoryTab(QWidget):
                 thumb.setText("No Image")
                 thumb.setStyleSheet("background:#181825; color:#585b70; border-radius:4px;")
 
+            h_aud_icon = QLabel("🔊 Audio Ready")
+            h_aud_icon.setAlignment(Qt.AlignCenter)
+            h_aud_icon.setStyleSheet("color: #a6e3a1; font-size: 11px;")
+            h_aud_icon.hide()
+
             if scene.get('audio_path') and os.path.exists(scene['audio_path']):
                 self._history_scene_audio_paths[i] = scene['audio_path']
+                h_aud_icon.show()
                 play_aud_btn.show()
                 try:
                     play_aud_btn.clicked.disconnect()
@@ -2365,7 +2672,10 @@ class HistoryTab(QWidget):
                     self._play_history_audio(p, idx, lbl, None)
                 )
 
-            def create_img_handler(idx=i, s=scene, status_lbl=img_status, btn=gen_img_btn, preview_lbl=thumb, view_btn=view_img_btn, _title_card=(i == 0)):
+            right_col.addWidget(thumb)
+            right_col.addWidget(h_aud_icon)
+
+            def create_img_handler(idx=i, s=scene, status_lbl=img_status, btn=gen_img_btn, preview_lbl=thumb, view_btn=view_img_btn, _title_card=(i == 0), _mobile_chk=self.history_mobile_friendly_chk):
                 out_path = os.path.join(self._history_topic_folder, f"scene_{idx+1}.jpg")
                 btn.setEnabled(False)
                 status_lbl.setText("⏳ Generating Image...")
@@ -2381,6 +2691,7 @@ class HistoryTab(QWidget):
                     _overlay,
                     s.get('narration', ''),
                     _title_card,
+                    _mobile_chk.isChecked(),
                 )
                 setattr(self, f"history_img_thread_{idx}", thread)
 
@@ -2390,10 +2701,13 @@ class HistoryTab(QWidget):
                         if success:
                             status_lbl.setText("✅ Image Generated!")
                             status_lbl.setStyleSheet("color: #a6e3a1;")
+                            btn.setText("🖼️ Re-Generate Image")
                             s['img_path'] = path
                             db.update_scene_asset(s.get('db_id'), 'img_path', path)
                             pix = QPixmap(path)
-                            preview_lbl.setPixmap(pix.scaled(142, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+                            _scaled = pix.scaled(142, 142, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            preview_lbl.setFixedSize(_scaled.width(), _scaled.height())
+                            preview_lbl.setPixmap(_scaled)
                             view_btn.show()
                             try:
                                 view_btn.clicked.disconnect()
@@ -2411,7 +2725,7 @@ class HistoryTab(QWidget):
                 thread.start()
 
             def create_aud_handler(
-                idx=i, s=scene, status_lbl=aud_status, btn=gen_aud_btn, play_btn=play_aud_btn
+                idx=i, s=scene, status_lbl=aud_status, btn=gen_aud_btn, play_btn=play_aud_btn, aud_icon=h_aud_icon
             ):
                 engine, voice = parse_tts_selection(self.history_tts_engine_combo.currentText())
                 stored_voice = s.get('tts_voice', '')
@@ -2440,6 +2754,8 @@ class HistoryTab(QWidget):
                         if success:
                             status_lbl.setText("✅ Audio Saved.")
                             status_lbl.setStyleSheet("color: #a6e3a1;")
+                            btn.setText("🎙️ Re-Generate Audio")
+                            aud_icon.show()
                             s['audio_path'] = path
                             s['tts_voice'] = voice
                             self._history_scene_audio_paths[idx] = path
@@ -2468,7 +2784,7 @@ class HistoryTab(QWidget):
             gen_aud_btn.clicked.connect(lambda _, f=create_aud_handler: f())
 
             card_layout.addLayout(text_block, stretch=3)
-            card_layout.addWidget(thumb)
+            card_layout.addLayout(right_col)
             self.scenes_layout.insertWidget(self.scenes_layout.count() - 1, card)
             self._history_scene_refs.append((scene, img_status, aud_status, thumb, view_img_btn, play_aud_btn))
             self._history_scene_audio_controls[i] = aud_status
@@ -2513,7 +2829,7 @@ class HistoryTab(QWidget):
         status_map = {idx: refs for idx, refs in enumerate(self._history_scene_refs)}
 
         self._history_bulk_thread = BulkGenerationThread(
-            self._current_scenes, self._history_topic_folder, engine, voice, skip_existing, self._current_topic
+            self._current_scenes, self._history_topic_folder, engine, voice, skip_existing, self._current_topic, self.history_mobile_friendly_chk.isChecked()
         )
 
         try:
@@ -2956,7 +3272,67 @@ class SettingsTab(QWidget):
         res_layout.addLayout(save_res_row)
 
         layout.addWidget(res_frame)
+
+        # Video Output Folder
+        folder_frame = QFrame()
+        folder_frame.setProperty("class", "card")
+        folder_layout = QVBoxLayout(folder_frame)
+        folder_layout.setSpacing(10)
+
+        folder_title = QLabel("Video Output Folder")
+        folder_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        folder_layout.addWidget(folder_title)
+
+        folder_desc = QLabel("Where finished videos are saved. You will be asked on the first stitch if not set.")
+        folder_desc.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        folder_desc.setWordWrap(True)
+        folder_layout.addWidget(folder_desc)
+
+        folder_row = QHBoxLayout()
+        self.folder_input = QLineEdit()
+        self.folder_input.setReadOnly(True)
+        self.folder_input.setPlaceholderText("Not set — will ask on first stitch")
+        saved_folder = os.getenv("VIDEO_OUTPUT_FOLDER", "").strip()
+        if saved_folder:
+            self.folder_input.setText(saved_folder)
+        folder_row.addWidget(self.folder_input)
+        browse_btn = QPushButton("📂 Browse")
+        browse_btn.setProperty("class", "secondary-button")
+        browse_btn.setFixedWidth(110)
+        browse_btn.clicked.connect(self._browse_output_folder)
+        folder_row.addWidget(browse_btn)
+        clear_btn = QPushButton("✕ Clear")
+        clear_btn.setProperty("class", "danger-button")
+        clear_btn.setFixedWidth(80)
+        clear_btn.clicked.connect(self._clear_output_folder)
+        folder_row.addWidget(clear_btn)
+        folder_layout.addLayout(folder_row)
+
+        self.folder_status_lbl = QLabel("")
+        folder_layout.addWidget(self.folder_status_lbl)
+
+        layout.addWidget(folder_frame)
         layout.addStretch()
+
+    def _browse_output_folder(self):
+        current = os.getenv("VIDEO_OUTPUT_FOLDER", "").strip() or os.path.expanduser("~")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose Video Output Folder", current)
+        if not chosen:
+            return
+        _save_env_key("VIDEO_OUTPUT_FOLDER", chosen)
+        _load_env()
+        self.folder_input.setText(chosen)
+        self.folder_status_lbl.setText("✅ Saved.")
+        self.folder_status_lbl.setStyleSheet("color: #a6e3a1;")
+        QTimer.singleShot(3000, lambda: self.folder_status_lbl.setText(""))
+
+    def _clear_output_folder(self):
+        _save_env_key("VIDEO_OUTPUT_FOLDER", "")
+        _load_env()
+        self.folder_input.clear()
+        self.folder_status_lbl.setText("Cleared — will ask on next stitch.")
+        self.folder_status_lbl.setStyleSheet("color: #a6adc8;")
+        QTimer.singleShot(3000, lambda: self.folder_status_lbl.setText(""))
 
     def _save_resolution(self):
         idx = self.res_combo.currentIndex()
@@ -3459,6 +3835,7 @@ class AppWindow(QMainWindow):
         
         self.current_scenes = []
         self.current_topic = ""
+        self.current_part_label = ''
         self._active_threads = []  # keeps BulkGenerationThread objects alive until done
 
         self._job_count_timer = QTimer(self)
@@ -3475,6 +3852,7 @@ class AppWindow(QMainWindow):
         # Connect Signals for Wizard Flow
         self.script_tab.next_requested.connect(self.on_script_next)
         self.script_tab.next_requested_topic.connect(lambda t: setattr(self, 'current_topic', t))
+        self.script_tab.next_requested_part_label.connect(lambda p: setattr(self, 'current_part_label', p))
         self.storyboard_tab.back_requested.connect(lambda: self.tabs.setCurrentIndex(0))
         self.storyboard_tab.next_requested.connect(lambda: self.tabs.setCurrentIndex(2))
         self.export_tab.back_requested.connect(lambda: self.tabs.setCurrentIndex(1))
@@ -3549,6 +3927,11 @@ class AppWindow(QMainWindow):
         if not self.current_topic:
             return ""
         safe_topic = make_safe_topic(self.current_topic)
+        output_folder = _get_video_output_folder()
+        if output_folder:
+            custom_path = os.path.join(output_folder, f"{safe_topic}.mp4")
+            if os.path.exists(custom_path):
+                return custom_path
         return os.path.join(_app_data_dir(), 'assets', safe_topic, f"{safe_topic}.mp4")
 
     def _start_spin(self, label, text):
@@ -3574,7 +3957,7 @@ class AppWindow(QMainWindow):
 
     def on_script_next(self, scenes):
         self.current_scenes = scenes
-        self.storyboard_tab.load_scenes(self.current_scenes, topic=self.current_topic)
+        self.storyboard_tab.load_scenes(self.current_scenes, topic=self.current_topic, part_label=self.current_part_label)
         self.tabs.setCurrentIndex(1)
         self.export_tab.reset_ui()
         self.export_tab.populate_thumbnails(self.current_scenes, self._current_video_path())
@@ -3599,15 +3982,24 @@ class AppWindow(QMainWindow):
             )
             return
             
+        # Ensure output folder is set — ask on first run
+        output_folder = _get_video_output_folder()
+        if not output_folder:
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Choose Video Output Folder", os.path.expanduser("~")
+            )
+            if not chosen:
+                return  # user cancelled
+            _save_env_key("VIDEO_OUTPUT_FOLDER", chosen)
+            _load_env()
+            output_folder = chosen
+
         self.export_tab.start_render_ui()
 
-        # Video goes into the same topic sub-folder
         safe_topic = make_safe_topic(self.current_topic)
-        topic_folder = os.path.join(_app_data_dir(), 'assets', safe_topic)
-        os.makedirs(topic_folder, exist_ok=True)
-        out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
+        out_path = os.path.join(output_folder, f"{safe_topic}.mp4")
 
-        self.stitch_thread = VideoStitchingThread(self.current_scenes, out_path)
+        self.stitch_thread = VideoStitchingThread(self.current_scenes, out_path, self.storyboard_tab.mobile_friendly_chk.isChecked())
         self.stitch_thread.finished.connect(self.on_stitch_finished)
         self._active_threads.append(self.stitch_thread)
         self.jobs_tab.add_stitch_job(self.stitch_thread, self.current_topic)
@@ -3667,12 +4059,21 @@ class AppWindow(QMainWindow):
 
     def on_history_restitch(self, scenes, topic):
         """Triggered by History tab Re-Stitch button — runs stitch in background, reports back inline."""
-        safe_topic = make_safe_topic(topic)
-        topic_folder = os.path.join(_app_data_dir(), 'assets', safe_topic)
-        os.makedirs(topic_folder, exist_ok=True)
-        out_path = os.path.join(topic_folder, f"{safe_topic}.mp4")
+        output_folder = _get_video_output_folder()
+        if not output_folder:
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Choose Video Output Folder", os.path.expanduser("~")
+            )
+            if not chosen:
+                return
+            _save_env_key("VIDEO_OUTPUT_FOLDER", chosen)
+            _load_env()
+            output_folder = chosen
 
-        self._history_stitch_thread = VideoStitchingThread(scenes, out_path)
+        safe_topic = make_safe_topic(topic)
+        out_path = os.path.join(output_folder, f"{safe_topic}.mp4")
+
+        self._history_stitch_thread = VideoStitchingThread(scenes, out_path, self.storyboard_tab.mobile_friendly_chk.isChecked())
         self._history_stitch_thread.finished.connect(self.on_history_restitch_done)
         self._active_threads.append(self._history_stitch_thread)
         self.jobs_tab.add_stitch_job(self._history_stitch_thread, topic)
